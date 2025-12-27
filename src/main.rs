@@ -182,6 +182,10 @@ impl ArcReplacer {
         None
     }
 
+
+    // UNDERSTAND THE WHY AND HOW BEHIND THIS FUNCTION
+    // not sure wtf this does lets keep it, later lets read more and understand how to it works
+    // implemented this translating english to rust
     fn remove(&mut self, frame_id: u32) {
 
         if self.evictable_pages.contains(&frame_id) {
@@ -221,6 +225,8 @@ impl ArcReplacer {
     }
 }
 
+
+// TESTS
 mod tests {
     use super::*;
 
@@ -455,5 +461,7 @@ mod tests {
 
 }
 
+
+// MAIN no need for this for now but yes just keep here 
 fn main() {
 }
