@@ -1,14 +1,14 @@
-use std::collections::VecDeque;
-use std::collections::HashSet;
-use std::collections::HashMap;
+use std::collections::{ HashMap, HashSet, VecDeque };
 use std::time::SystemTime;
-use std::fs::OpenOptions;
+use std::fs::{ remove_file, OpenOptions, File};
 use std::sync::Mutex;
+use std::io::{self, Read, Write, SeekFrom, Seek };
 
 type PageId = u32;
 type FrameId = u32;
 
 const PAGE_SIZE: usize = 8192;
+const DB_IO_SIZE: usize = 16;
 
 struct ArcReplacer {
     mru: VecDeque<(FrameId, PageId)>, // most recently used list
@@ -230,7 +230,7 @@ impl ArcReplacer {
 }
 
 // Arc replacer TESTS
-mod arcReplacerTests {
+mod arc_replacer_tests {
     use super::*;
 
     #[test]
@@ -465,22 +465,20 @@ mod arcReplacerTests {
 }
 
 /**
- *
- * Step 3: Implement DiskScheduler
+ * Implement DiskScheduler
  * Create channel: mpsc::channel()
  * Background thread: spawn worker thread
  * Process requests: worker receives from channel, calls DiskManager
  * Promise equivalent: use Arc<Mutex<bool>> or oneshot channel
  * Test: queue requests, verify they complete
  */
-
 enum DisRequestType {
     Read,
     Write,
 }
 
 struct DiskRequest {
-    type: DisRequestType,
+    r#type: DisRequestType,
     promise: bool,
     page_id: PageId,
 }
@@ -497,11 +495,11 @@ impl DiskScheduler {
     // thread safety please
     // a constructor and destrcutor implemented for creating and joining the background worker thread
 
-    schedule(&self, requets: Vec<DiskRequest>) {
+    fn schedule(&self, _: Vec<DiskRequest>) {
         // schedule a vector of requests for the disk manager to execute
     }
 
-    start_worker_thread(&self) {
+    fn start_worker_thread(&self) {
         // start the worker thread
         // worker thread created in disk Scheduler constructor
         // receive queued requests  => dispatch to disk manager
@@ -512,112 +510,114 @@ impl DiskScheduler {
 
 struct DiskManager {
     db_file: Mutex<File>,
-    log_file: File,
-    page_capacity: u64,
-    page_size: u64,
-    buffer_used: Option<*const u8>,
+    page_capacity: usize,
+    page_size: usize,
     pages: Mutex<HashMap<PageId, u64>>,
     num_writes: Mutex<u64>,
+    free_slots: Vec<u64>,
 }
 
 /**
- * 
- * Step 2: Implement DiskManager first
+ *  Implement DiskManager first
  * File I/O: File, OpenOptions, read(), write(), seek()
  * Start simple: open a file, write a page, read it back
  * Add page allocation: track offsets, reuse deleted slots
  * Test: verify you can read/write pages correctly
  */
 impl DiskManager {
-    /**
-     * Part 1: Basic file operations
-     * Create struct with a File handle
-     * Implement new(): open/create database file
-     * Implement write_page(): write 8KB to file at calculated offset
-     * Implement read_page(): read 8KB from file at calculated offset
-     * Test: write a page, read it back, verify data matches
-     * 
-     * Part 2: Page tracking
-     * Add HashMap<PageId, u64> to track page_id → file offset
-     * Update write_page(): store offset in map
-     * Update read_page(): look up offset from map
-     * Test: write multiple pages, read them back
-     * Part 3: Page allocation
-     * Add Vec<u64> for free slots (deleted pages)
-     * Update allocation: reuse free slots first, then append to end
-     * Add delete_page(): mark slot as free
-     * Test: delete a page, allocate new page, verify it reuses the slot
-     */
-
-    fn new(file_path: &str) {
-        let log_file_name = format!("{}.log", file_path);
-
-        _log_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            open(log_file_name)?;
-
-        _db_file = Options::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(file_path)?;
+    fn new(file_path: &str) -> Self {
         
-        _db_file_.set_len((self.page_capacity + 1) * self.page_size)
+        let db_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(file_path).unwrap();
+        
+        let page_capacity = DB_IO_SIZE;
+        let page_size = PAGE_SIZE;
+    
+        db_file.set_len(((page_capacity + 1) * page_size) as u64);
 
-        let metadata = _db_file_.metadat()?;
+        let metadata = db_file.metadata().unwrap();
 
-        if(metadata.len() >= self.page_capacity * self.page_size) {
+        if metadata.len() < (page_capacity * page_size) as u64 {
             panic!("Error Database file is too large");
         }
 
-        
         Self {
-            db_file: Mutex::new(_db_file),
-            log_file: _log_file,
-            buffer_used: None,
+            db_file: Mutex::new(db_file),
+            pages: Mutex::new(HashMap::new()),
+            num_writes: Mutex::new(0),
+            page_capacity: DB_IO_SIZE,
+            page_size: PAGE_SIZE,
+            free_slots: Vec::new(),
         }
     }
 
-    fn write_page(page_id: PageId, page_data: &[u8]) {
-        let mut file = self.db_file.lock();
+    fn write_page(&mut self, page_id: PageId, page_data: &[u8]) -> Result<(), std::io::Error> {
+        let mut file = self.db_file.lock().unwrap();
         let offset =  {
             let mut pages = self.pages.lock().unwrap();
-            pages.get(&page_id)
-                .copied()
-                .unwrap_or_else( || {
-                    let new_offset = self.allocate_page(&mut file)?;
-                    pages.insert(page_id, new_offset);
-                    new_offset
-                })
+            if let Some(&existing_offset) = pages.get(&page_id) {
+                existing_offset
+            } else {
+                let mut new_offset: u64 = 0;
+                if self.free_slots.is_empty() {
+                    new_offset = { 
+                       if let Some(value) = self.free_slots.pop() {
+                            value
+                       } else {
+                        println!("No free slots available");
+                        0
+                       }
+                    };
+                }
+        
+                if pages.len() + 1 >= self.page_capacity {
+                    self.page_capacity *= 2;
+                    file.set_len(((self.page_capacity + 1) * PAGE_SIZE) as u64);
+                    new_offset = (pages.len() * PAGE_SIZE) as u64
+                    
+                }
+                pages.insert(page_id, new_offset);
+                new_offset
+            }
         };
 
         file.seek(SeekFrom::Start(offset))?;
-        file.write_all(page_data[..PAGE_SIZE])?;
+        file.write_all(&page_data[..PAGE_SIZE])?;
 
         *self.num_writes.lock().unwrap() += 1;
         self.pages.lock().unwrap().insert(page_id, offset);
 
         file.flush()?;
 
-        ok(())
+        Ok(())
     }
 
-    fn read_page(page_id: PageId, page_data: &[u8]) {
-        let mut file = self.db_file.lock();
+    fn read_page<'a>(&mut self, page_id: PageId, page_data: &'a mut[u8]) -> Result<&'a[u8], std::io::Error> {
+        let mut file = self.db_file.lock().unwrap();
         let offset = {
             let mut pages = self.pages.lock().unwrap();
-            pages.get(&page_id)
-                .copied()
-                unwrap_or_else( || {
-                    let new_offset = self.allocate_page(&mut file)?;
-                    pages.insert(page_id, new_offset);
-                    new_offset
-                })
+            if let Some(&existing_offset) = pages.get(&page_id) {
+                existing_offset
+            } else {
+                let mut new_offset: u64 = 0;
+                if self.free_slots.is_empty() {
+                    new_offset = self.free_slots.pop().unwrap();
+                }
+        
+                if pages.len() + 1 >= self.page_capacity {
+                    self.page_capacity *= 2;
+                    file.set_len(((self.page_capacity + 1) * PAGE_SIZE) as u64);
+                    new_offset = (pages.len() * PAGE_SIZE) as u64
+                }
+                pages.insert(page_id, new_offset);
+                new_offset
+            }
         };
 
-        let file_size = self.get_file_size(&self.db_file_name)?;
+        let file_size = file.metadata().unwrap().len();
 
         if file_size < 0 {
             panic!("Failed to get file size");
@@ -629,19 +629,43 @@ impl DiskManager {
 
         file.seek(SeekFrom::Start(offset))?;
         match file.read_exact(&mut page_data[..PAGE_SIZE]) {
-            Ok(_) => Ok(page_data)
+            Ok(_) => {
+                return Ok(page_data)
+            }
 
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 eprintln!("I/O error: read page {} hit end of file  at offset {}", page_id, offset);
-                Ok(page_data)
+                return Ok(page_data)
+            }
+
+            Err(e) => {
+                return Err(e)
             }
         }
-        Ok(page_data)
     }
+}
 
-    fn get_file_size(file_name: &str) -> Result<u64, std::io::Error> {
-        let metadata = fs::metadata(filename)?;
-        Ok(metadata.len())
+mod dis_manager_tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_operations() {
+        let test_file = "test.db";
+        let _ = remove_file(test_file);
+
+        let mut dm = DiskManager::new(test_file);
+
+        let page_data = b"Hello world".repeat(PAGE_SIZE / 10);
+        let page_data = &page_data[..PAGE_SIZE];
+
+        dm.write_page(0, page_data).unwrap();
+
+        let mut buffer = vec![0u8; PAGE_SIZE];
+        dm.read_page(0, &mut buffer).unwrap();
+
+        assert_eq!(&page_data[..1], &buffer[..1]);
+
+        let _ = remove_file(test_file);
     }
 }
 
