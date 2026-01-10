@@ -604,7 +604,14 @@ impl DiskManager {
             } else {
                 let mut new_offset: u64 = 0;
                 if self.free_slots.is_empty() {
-                    new_offset = self.free_slots.pop().unwrap();
+                    new_offset = { 
+                       if let Some(value) = self.free_slots.pop() {
+                            value
+                       } else {
+                        println!("No free slots available");
+                        0
+                       }
+                    };
                 }
         
                 if pages.len() + 1 >= self.page_capacity {
