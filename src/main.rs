@@ -469,7 +469,7 @@ mod arc_replacer_tests {
  * Create channel: mpsc::channel()
  * Background thread: spawn worker thread
  * Process requests: worker receives from channel, calls DiskManager
- * Promise equivalent: use Arc<Mutex<bool>> or oneshot channel
+ * Promise equivalent: use Arc<Mutex<bool>> or channel
  * Test: queue requests, verify they complete
  */
 enum DisRequestType {
@@ -514,6 +514,7 @@ struct DiskManager {
     page_size: usize,
     pages: Mutex<HashMap<PageId, u64>>,
     num_writes: Mutex<u64>,
+    num_deletes: Mutex<u64>,
     free_slots: Vec<u64>,
 }
 
@@ -551,6 +552,7 @@ impl DiskManager {
             page_capacity: DB_IO_SIZE,
             page_size: PAGE_SIZE,
             free_slots: Vec::new(),
+            num_deletes: Mutex::new(0),
         }
     }
 
@@ -562,7 +564,7 @@ impl DiskManager {
                 existing_offset
             } else {
                 let mut new_offset: u64 = 0;
-                if self.free_slots.is_empty() {
+                if !self.free_slots.is_empty() {
                     new_offset = { 
                        if let Some(value) = self.free_slots.pop() {
                             value
@@ -603,7 +605,7 @@ impl DiskManager {
                 existing_offset
             } else {
                 let mut new_offset: u64 = 0;
-                if self.free_slots.is_empty() {
+                if !self.free_slots.is_empty() {
                     new_offset = { 
                        if let Some(value) = self.free_slots.pop() {
                             value
@@ -624,11 +626,13 @@ impl DiskManager {
             }
         };
 
-        let file_size = file.metadata().unwrap().len();
-
-        if file_size < 0 {
-            panic!("Failed to get file size");
-        }
+        let file_size = match file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(e) => {
+                eprintln!("Error getting file size: {}", e);
+                return Err(e);
+            }
+        };
 
         if offset > file_size {
             panic!("Page out of bounds");
@@ -650,13 +654,29 @@ impl DiskManager {
             }
         }
     }
+
+    fn delete_page(&mut self, page_id: PageId) -> Result<(), std::io::Error> {
+        let mut pages = self.pages.lock().unwrap();
+
+        match pages.remove(&page_id) {
+            Some(offset) => {
+                self.free_slots.push(offset);
+                *self.num_deletes.lock().unwrap() += 1;
+            } 
+            None => {
+                println!("Page {} not found", page_id);
+            }
+        }
+    
+        Ok(())
+    }
 }
 
 mod dis_manager_tests {
     use super::*;
 
     #[test]
-    fn test_basic_operations() {
+    fn test_basic_write_read_delete_operations() {
         let test_file = "test.db";
         let _ = remove_file(test_file);
 
@@ -667,13 +687,24 @@ mod dis_manager_tests {
 
         dm.write_page(0, page_data).unwrap();
 
+        assert_eq!(*dm.num_writes.lock().unwrap(), 1);
+
         let mut buffer = vec![0u8; PAGE_SIZE];
         dm.read_page(0, &mut buffer).unwrap();
 
+        assert_eq!(dm.free_slots.len(), 0);
         assert_eq!(&page_data[..1], &buffer[..1]);
+
+        dm.delete_page(0).unwrap();
+
+        assert_eq!(*dm.num_deletes.lock().unwrap(), 1);
+        assert_eq!(dm.free_slots.len(), 1);
+
+        assert_eq!(dm.page_capacity, DB_IO_SIZE);
 
         let _ = remove_file(test_file);
     }
+
 }
 
 // MAIN no need for this for now but yes just keep here 
