@@ -537,7 +537,7 @@ impl DiskManager {
         let page_capacity = DB_IO_SIZE;
         let page_size = PAGE_SIZE;
     
-        db_file.set_len(((page_capacity + 1) * page_size) as u64);
+        let _ = db_file.set_len(((page_capacity + 1) * page_size) as u64);
 
         let metadata = db_file.metadata().unwrap();
 
@@ -559,13 +559,12 @@ impl DiskManager {
     fn write_page(&mut self, page_id: PageId, page_data: &[u8]) -> Result<(), std::io::Error> {
         let mut file = self.db_file.lock().unwrap();
         let offset =  {
-            let mut pages = self.pages.lock().unwrap();
+            let pages = self.pages.lock().unwrap();
             if let Some(&existing_offset) = pages.get(&page_id) {
                 existing_offset
             } else {
-                let mut new_offset: u64 = 0;
                 if !self.free_slots.is_empty() {
-                    new_offset = { 
+                    let new_offset: u64 = { 
                        if let Some(value) = self.free_slots.pop() {
                             value
                        } else {
@@ -573,16 +572,18 @@ impl DiskManager {
                         0
                        }
                     };
+
+                    new_offset
+                }  else {
+                    println!("wiw");
+                    if pages.len() + 1 >= self.page_capacity {
+                        self.page_capacity *= 2;
+                        let _ = file.set_len(((self.page_capacity + 1) * PAGE_SIZE) as u64);
+                    }
+                    let new_offset: u64 = (pages.len() * PAGE_SIZE) as u64;
+
+                    new_offset
                 }
-        
-                if pages.len() + 1 >= self.page_capacity {
-                    self.page_capacity *= 2;
-                    file.set_len(((self.page_capacity + 1) * PAGE_SIZE) as u64);
-                    new_offset = (pages.len() * PAGE_SIZE) as u64
-                    
-                }
-                pages.insert(page_id, new_offset);
-                new_offset
             }
         };
 
@@ -600,13 +601,12 @@ impl DiskManager {
     fn read_page<'a>(&mut self, page_id: PageId, page_data: &'a mut[u8]) -> Result<&'a[u8], std::io::Error> {
         let mut file = self.db_file.lock().unwrap();
         let offset = {
-            let mut pages = self.pages.lock().unwrap();
+            let pages = self.pages.lock().unwrap();
             if let Some(&existing_offset) = pages.get(&page_id) {
                 existing_offset
             } else {
-                let mut new_offset: u64 = 0;
                 if !self.free_slots.is_empty() {
-                    new_offset = { 
+                    let new_offset: u64 = { 
                        if let Some(value) = self.free_slots.pop() {
                             value
                        } else {
@@ -614,15 +614,16 @@ impl DiskManager {
                         0
                        }
                     };
+
+                    new_offset
+                } else {          
+                    if pages.len() + 1 >= self.page_capacity {
+                        self.page_capacity *= 2;
+                        let _ = file.set_len(((self.page_capacity + 1) * PAGE_SIZE) as u64);
+                    }
+                    let new_offset: u64 = (pages.len() * PAGE_SIZE) as u64;
+                    new_offset
                 }
-        
-                if pages.len() + 1 >= self.page_capacity {
-                    self.page_capacity *= 2;
-                    file.set_len(((self.page_capacity + 1) * PAGE_SIZE) as u64);
-                    new_offset = (pages.len() * PAGE_SIZE) as u64
-                }
-                pages.insert(page_id, new_offset);
-                new_offset
             }
         };
 
@@ -672,7 +673,7 @@ impl DiskManager {
     }
 }
 
-mod dis_manager_tests {
+mod disk_manager_tests {
     use super::*;
 
     #[test]
@@ -701,6 +702,73 @@ mod dis_manager_tests {
         assert_eq!(dm.free_slots.len(), 1);
 
         assert_eq!(dm.page_capacity, DB_IO_SIZE);
+
+        let _ = remove_file(test_file);
+    }
+    
+    #[test]
+    fn test_use_existing_slot() {
+        let test_file =  "test.db";
+        let _ = remove_file(test_file);
+
+        let mut dm = DiskManager::new(test_file);
+
+        let page_data = b"Hello world".repeat(PAGE_SIZE / 10);
+        let page_data = &page_data[..PAGE_SIZE];
+        dm.write_page(1, page_data).unwrap();
+        dm.write_page(2, page_data).unwrap();
+        dm.write_page(3, page_data).unwrap();
+        dm.write_page(4, page_data).unwrap();
+        dm.write_page(5, page_data).unwrap();
+
+        assert_eq!(*dm.num_writes.lock().unwrap(), 5);
+        let third_offset = {
+            let binding = dm.pages.lock().unwrap();
+            binding.get(&3).unwrap().clone()
+        };
+
+        dm.delete_page(3).unwrap();
+        
+        assert_eq!(dm.free_slots.contains(&third_offset), true);
+        assert_eq!(dm.free_slots.len(), 1);
+    
+        dm.write_page(9, page_data).unwrap();
+
+        let ninth_offset = {
+            let binding = dm.pages.lock().unwrap();
+            binding.get(&9).unwrap().clone()
+        };
+        assert_eq!(dm.free_slots.len(), 0);
+        assert_eq!(third_offset, ninth_offset);
+
+        let second_offset = {
+            let binding = dm.pages.lock().unwrap();
+            println!("binding: {:?}", binding);
+            binding.get(&2).unwrap().clone()
+        };
+        assert_ne!(second_offset, third_offset);
+
+        let _ = remove_file(test_file);
+    }
+
+    #[test]
+    fn test_increase_page_capacity() {
+        let test_file = "test.db";
+        let _ = remove_file(test_file);
+
+        let mut dm = DiskManager::new(test_file);
+
+        dm.page_capacity = 3;
+
+        let page_data = b"Hello world".repeat(PAGE_SIZE / 10);
+        let page_data = &page_data[..PAGE_SIZE];
+
+        dm.write_page(1, page_data).unwrap();
+        dm.write_page(2, page_data).unwrap();
+        dm.write_page(3, page_data).unwrap();
+
+        assert_eq!(dm.page_capacity, 6);
+        assert_eq!(dm.db_file.lock().unwrap().metadata().unwrap().len(), 57344);
 
         let _ = remove_file(test_file);
     }
