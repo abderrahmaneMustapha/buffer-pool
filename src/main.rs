@@ -10,11 +10,18 @@ type FrameId = u32;
 const PAGE_SIZE: usize = 8192;
 const DB_IO_SIZE: usize = 16;
 
+// ============================================================================
+// SECTION 1: ARC REPLACER
+// ============================================================================
+// Adaptive Replacement Cache (ARC) replacement policy implementation
+// Tracks page usage and decides which frames to evict from buffer pool
+// ============================================================================
+
 struct ArcReplacer {
     mru: VecDeque<(FrameId, PageId)>, // most recently used list
     mfu: VecDeque<(FrameId, PageId)>, // most frequently used list
     timestamp_access: HashMap<(FrameId, PageId), SystemTime>, // record when sepecifc page is accessed in timestamp in a frame
-    
+
     mru_ghost: VecDeque<PageId>, // most recently used evicted from buffer pool
     mfu_ghost: VecDeque<PageId>, // most frequently used evicted from buffer pool
 
@@ -186,7 +193,6 @@ impl ArcReplacer {
         None
     }
 
-
     // UNDERSTAND THE WHY AND HOW BEHIND THIS FUNCTION
     // not sure wtf this does lets keep it, later lets read more and understand how to it works
     // implemented this translating english to rust
@@ -229,7 +235,14 @@ impl ArcReplacer {
     }
 }
 
-// Arc replacer TESTS
+// ============================================================================
+// END OF SECTION 1: ARC REPLACER
+// ============================================================================
+
+// ============================================================================
+// SECTION 1 TESTS: ARC REPLACER TESTS
+// ============================================================================
+
 #[cfg(test)]
 mod arc_replacer_tests {
     use super::*;
@@ -462,17 +475,19 @@ mod arc_replacer_tests {
         assert_eq!(replacer.mru_ghost.contains(&3), true);
         assert_eq!(replacer.mfu_ghost.contains(&4), true);
     }
-
 }
 
-/**
- * Implement DiskScheduler
- * Create channel: mpsc::channel()
- * Background thread: spawn worker thread
- * Process requests: worker receives from channel, calls DiskManager
- * Promise equivalent: use Arc<Mutex<bool>> or channel
- * Test: queue requests, verify they complete
- */
+// ============================================================================
+// END OF SECTION 1 TESTS: ARC REPLACER TESTS
+// ============================================================================
+
+// ============================================================================
+// SECTION 2: DISK SCHEDULER
+// ============================================================================
+// Schedules disk read/write operations asynchronously
+// Uses background worker thread to process queued requests
+// ============================================================================
+
 enum DisRequestType {
     Read,
     Write,
@@ -508,6 +523,18 @@ impl DiskScheduler {
 
     // signal that the request is completed
 }
+
+// ============================================================================
+// END OF SECTION 2: DISK SCHEDULER
+// ============================================================================
+
+// ============================================================================
+// SECTION 3: DISK MANAGER
+// ============================================================================
+// Handles file I/O operations for database pages
+// Reads/writes 8KB pages to/from disk files
+// Manages page allocation and free slot reuse
+// ============================================================================
 
 struct DiskManager {
     db_file: Mutex<File>,
@@ -674,6 +701,14 @@ impl DiskManager {
     }
 }
 
+// ============================================================================
+// END OF SECTION 3: DISK MANAGER
+// ============================================================================
+
+// ============================================================================
+// SECTION 3 TESTS: DISK MANAGER TESTS
+// ============================================================================
+
 #[cfg(test)]
 mod disk_manager_tests {
     use super::*;
@@ -776,6 +811,13 @@ mod disk_manager_tests {
     }
 }
 
-// MAIN no need for this for now but yes just keep here 
+// ============================================================================
+// END OF SECTION 3 TESTS: DISK MANAGER TESTS
+// ============================================================================
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
 fn main() {
 }
