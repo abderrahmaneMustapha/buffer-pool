@@ -86,7 +86,7 @@ impl ArcReplacer {
                 self.mru_target_size -= 1;
             } else {
                 let decrease: u32 = (self.mru_ghost.len() / self.mfu_ghost.len()) as u32;
-                if self.mru_target_size - decrease >= 0 {
+                if self.mru_target_size >= decrease {
                     self.mru_target_size -= decrease;
                 }
             }
@@ -230,6 +230,7 @@ impl ArcReplacer {
 }
 
 // Arc replacer TESTS
+#[cfg(test)]
 mod arc_replacer_tests {
     use super::*;
 
@@ -519,7 +520,7 @@ struct DiskManager {
 }
 
 /**
- *  Implement DiskManager first
+ *  Implement DiskManager
  * File I/O: File, OpenOptions, read(), write(), seek()
  * Start simple: open a file, write a page, read it back
  * Add page allocation: track offsets, reuse deleted slots
@@ -673,6 +674,7 @@ impl DiskManager {
     }
 }
 
+#[cfg(test)]
 mod disk_manager_tests {
     use super::*;
 
@@ -772,7 +774,6 @@ mod disk_manager_tests {
 
         let _ = remove_file(test_file);
     }
-
 }
 
 // MAIN no need for this for now but yes just keep here 
