@@ -1,8 +1,9 @@
 use std::collections::{ HashMap, HashSet, VecDeque };
 use std::time::SystemTime;
 use std::fs::{ remove_file, OpenOptions, File};
-use std::sync::Mutex;
+use std::sync::{Mutex, Arc, mpsc};
 use std::io::{self, Read, Write, SeekFrom, Seek };
+use std::thread;
 
 type PageId = u32;
 type FrameId = u32;
@@ -488,40 +489,70 @@ mod arc_replacer_tests {
 // Uses background worker thread to process queued requests
 // ============================================================================
 
-enum DisRequestType {
+enum DiskRequestType {
     Read,
     Write,
 }
 
 struct DiskRequest {
-    r#type: DisRequestType,
-    promise: bool,
+    r#type: DiskRequestType,
+    promise: mpsc::Sender<bool>,
+    data: Vec<u8>,
     page_id: PageId,
 }
 
 struct DiskScheduler {
-
+    request_tx: mpsc::Sender<Option<DiskRequest>>,
+    disk_manager: Arc<Mutex<DiskManager>>,
+    worker_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl DiskScheduler {
-    // queue disk requests
-    // shared queue to schedule and process disk requests
-    // thread add request to the queue
-    // disk background worker will process queued requests
-    // thread safety please
-    // a constructor and destrcutor implemented for creating and joining the background worker thread
+    fn new(disk_manager: Arc<Mutex<DiskManager>>) -> Self {
+        let (request_tx, request_rx) = mpsc::channel::<Option<DiskRequest>>();
+        let dm = Arc::clone(&disk_manager);
 
-    fn schedule(&self, _: Vec<DiskRequest>) {
-        // schedule a vector of requests for the disk manager to execute
+        let worker_handle = thread::spawn(move || {
+            while let Ok(Some(mut request)) = request_rx.recv() {
+                let mut dm = dm.lock().unwrap();
+
+                match request.r#type {
+                    DiskRequestType::Read => {
+                        match dm.read_page(request.page_id, &mut request.data[..])  {
+                            Ok(_) => { let _ = request.promise.send(true);}
+                            Err(_) => { let _ = request.promise.send(false);}
+                        }
+                    }
+                    DiskRequestType::Write => {
+                        match dm.write_page(request.page_id, &request.data[..]) {
+                            Ok(_) => { let _ = request.promise.send(true);}
+                            Err(_) => { let _ = request.promise.send(false);}
+                        }
+                    }
+                }
+            }
+        });
+
+        Self {
+            request_tx,
+            disk_manager,
+            worker_handle: Some(worker_handle),
+        }
     }
 
-    fn start_worker_thread(&self) {
-        // start the worker thread
-        // worker thread created in disk Scheduler constructor
-        // receive queued requests  => dispatch to disk manager
+    fn schedule(&self, request: DiskRequest) {
+        self.request_tx.send(Some(request)).unwrap();
     }
+}
 
-    // signal that the request is completed
+impl Drop for DiskScheduler {
+    fn drop(&mut self) {
+        let _ = self.request.tx.send(None);
+
+        if let Some(handle) = self.worker_handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 // ============================================================================
