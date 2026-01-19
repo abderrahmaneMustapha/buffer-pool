@@ -868,6 +868,31 @@ mod disk_manager_tests {
 // END OF SECTION 3: DISK MANAGER
 // ============================================================================
 
+
+// ============================================================================
+// SECTION 4: BUFFER POOL MANAGER
+// ============================================================================
+// Manages the buffer pool and the ARC replacer
+// ============================================================================
+
+
+/**
+ *  To  Implement BufferPoolManager i need to
+ *  - Read about RaII , Page Guards Write and Read then implement this
+ *  - Read frame manager understand the role plan and implement a basic one and enahance it while implementing buffer pool manager
+ *  - understand the conccuurency issues that we might face and plan how to solve it 
+ *  - Implement buffer pool manager with the frame manager and the disk manager
+ * 
+ */
+struct BufferPoolManager {
+    buffer_pool: Vec<u8>,
+}
+
+// ============================================================================
+// END OF SECTION 4: BUFFER POOL MANAGER
+// ============================================================================
+
+
 // ============================================================================
 // MAIN
 // ============================================================================
