@@ -1,6 +1,6 @@
 use std::collections::{ HashMap, HashSet, VecDeque };
 use std::time::SystemTime;
-use std::fs::{ remove_file, OpenOptions, File};
+use std::fs::{remove_file, OpenOptions, File};
 use std::sync::{Mutex, Arc, mpsc};
 use std::io::{self, Read, Write, SeekFrom, Seek };
 use std::thread;
@@ -17,7 +17,6 @@ const DB_IO_SIZE: usize = 16;
 // Adaptive Replacement Cache (ARC) replacement policy implementation
 // Tracks page usage and decides which frames to evict from buffer pool
 // ============================================================================
-
 struct ArcReplacer {
     mru: VecDeque<(FrameId, PageId)>, // most recently used list
     mfu: VecDeque<(FrameId, PageId)>, // most frequently used list
@@ -235,14 +234,6 @@ impl ArcReplacer {
         self.mfu_ghost.retain(|&p| p != page_id_option.unwrap_or(0));
     }
 }
-
-// ============================================================================
-// END OF SECTION 1: ARC REPLACER
-// ============================================================================
-
-// ============================================================================
-// SECTION 1 TESTS: ARC REPLACER TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod arc_replacer_tests {
@@ -477,10 +468,10 @@ mod arc_replacer_tests {
         assert_eq!(replacer.mfu_ghost.contains(&4), true);
     }
 }
+// ============================================================================
+// END OF SECTION 1:  ARC REPLACER
+// ============================================================================
 
-// ============================================================================
-// END OF SECTION 1 TESTS: ARC REPLACER TESTS
-// ============================================================================
 
 // ============================================================================
 // SECTION 2: DISK SCHEDULER
@@ -488,7 +479,6 @@ mod arc_replacer_tests {
 // Schedules disk read/write operations asynchronously
 // Uses background worker thread to process queued requests
 // ============================================================================
-
 enum DiskRequestType {
     Read,
     Write,
@@ -547,7 +537,7 @@ impl DiskScheduler {
 
 impl Drop for DiskScheduler {
     fn drop(&mut self) {
-        let _ = self.request.tx.send(None);
+        let _ = self.request_tx.send(None);
 
         if let Some(handle) = self.worker_handle.take() {
             let _ = handle.join();
@@ -555,9 +545,50 @@ impl Drop for DiskScheduler {
     }
 }
 
+#[cfg(test)]
+mod disk_scheduler_tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_read_write_operations() {
+        let test_file = "test.db";
+        let _ = remove_file(test_file);
+        let dm = Arc::new(Mutex::new(DiskManager::new(test_file)));
+        let scheduler = DiskScheduler::new(dm);
+
+
+        let page_data = b"Hello world".repeat(PAGE_SIZE / 10);
+        let page_data = &page_data[..PAGE_SIZE];
+
+        let (tx1, rx1 ) = mpsc::channel::<bool>();
+        let req1 = DiskRequest {
+           r#type: DiskRequestType::Write,
+           page_id: 0,
+           data: page_data.to_vec(),
+           promise: tx1,
+        };
+
+        scheduler.schedule(req1);
+        assert!(rx1.recv().unwrap());
+
+        let (tx2, rx2) = mpsc::channel::<bool>();
+        let req2 = DiskRequest {
+            r#type: DiskRequestType::Read,
+            page_id: 1,
+            data: page_data.to_vec(),
+            promise: tx2,
+        };
+
+        scheduler.schedule(req2);
+        assert!(rx2.recv().unwrap());
+
+        let _ = remove_file(test_file);
+    }
+}
 // ============================================================================
 // END OF SECTION 2: DISK SCHEDULER
 // ============================================================================
+
 
 // ============================================================================
 // SECTION 3: DISK MANAGER
@@ -634,7 +665,6 @@ impl DiskManager {
 
                     new_offset
                 }  else {
-                    println!("wiw");
                     if pages.len() + 1 >= self.page_capacity {
                         self.page_capacity *= 2;
                         let _ = file.set_len(((self.page_capacity + 1) * PAGE_SIZE) as u64);
@@ -731,14 +761,6 @@ impl DiskManager {
         Ok(())
     }
 }
-
-// ============================================================================
-// END OF SECTION 3: DISK MANAGER
-// ============================================================================
-
-// ============================================================================
-// SECTION 3 TESTS: DISK MANAGER TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod disk_manager_tests {
@@ -843,7 +865,7 @@ mod disk_manager_tests {
 }
 
 // ============================================================================
-// END OF SECTION 3 TESTS: DISK MANAGER TESTS
+// END OF SECTION 3: DISK MANAGER
 // ============================================================================
 
 // ============================================================================
