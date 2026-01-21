@@ -1,9 +1,10 @@
 use std::collections::{ HashMap, HashSet, VecDeque };
 use std::time::SystemTime;
 use std::fs::{remove_file, OpenOptions, File};
-use std::sync::{Mutex, Arc, mpsc};
+use std::sync::{Mutex, Arc, mpsc, RwLock};
 use std::io::{self, Read, Write, SeekFrom, Seek };
 use std::thread;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 type PageId = u32;
 type FrameId = u32;
@@ -876,6 +877,32 @@ mod disk_manager_tests {
 // ============================================================================
 
 
+struct FrameHeader {
+    frame_id: FrameId,
+    rw_latch: RwLock<()>,
+    pin_count: AtomicUsize,
+    is_dirty: bool, // if false means no thread is currently using this frame its safe to evict or reuse
+    data: Vec<u8>,
+}
+
+impl FrameHeader {
+    fn new(frame_id: FrameId) -> Self {
+        Self {
+            frame_id,
+            rw_latch: RwLock::new(()),
+            pin_count: AtomicUsize::new(0),
+            is_dirty: false,
+            data: vec![0u8, PAGE_SIZE as u8],
+        }
+    }
+
+    fn reset(&mut self) {
+        self.data.fill(0);
+        // TODO: check if we can use Relaxed here and if it will affect the correctness of the program
+        self.pin_count.store(0, Ordering::SeqCst);
+        self.is_dirty = false;
+    }
+}
 /**
  *  To  Implement BufferPoolManager i need to
  *  - Read about RaII , Page Guards Write and Read then implement this
