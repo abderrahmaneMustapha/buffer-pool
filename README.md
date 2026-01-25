@@ -25,7 +25,7 @@ BufferPool ──► DiskScheduler ──► DiskManager ──► Disk
      └──────────────┘
        completion
 ```
-
+              
 ## Implementation
 
 This project implements the ARC replacer in Rust. The `ArcReplacer` tracks page access patterns and decides which frames to evict when the buffer pool is full. It supports:

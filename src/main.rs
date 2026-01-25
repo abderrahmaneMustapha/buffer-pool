@@ -876,7 +876,6 @@ mod disk_manager_tests {
 // Manages the buffer pool and the ARC replacer
 // ============================================================================
 
-
 struct FrameHeader {
     frame_id: FrameId,
     rw_latch: RwLock<()>,
@@ -904,15 +903,76 @@ impl FrameHeader {
     }
 }
 /**
- *  To  Implement BufferPoolManager i need to
+ * To Implement BufferPoolManager i need to
  *  - Read about RaII , Page Guards Write and Read then implement this
  *  - Read frame manager understand the role plan and implement a basic one and enahance it while implementing buffer pool manager
  *  - understand the conccuurency issues that we might face and plan how to solve it 
  *  - Implement buffer pool manager with the frame manager and the disk manager
- * 
  */
 struct BufferPoolManager {
-    buffer_pool: Vec<u8>,
+    num_frames: usize,
+    next_page_id: AtomicUsize,
+    arc_replacer: Arc<ArcReplacer>,
+    disk_scheduler: Arc<DiskScheduler>,
+    frames: Vec<FrameHeader>,
+    free_frames: Vec<FrameId>,
+    latch: Arc<Mutex<()>>
+    page_table: HashMap<PageId, FrameId>
+}
+
+
+/**
+ * functions implementation order 
+ * 1. GetPinCount()
+ * 2. NewPage()
+ * 3. ReadPageGuard
+ * 4. WritePageGuard
+ * 5. CheckedReadPage()
+ * 6. CheckedWritePage()
+ * 7. DeletePage()
+ * 8. FlushPage()
+ */
+impl BufferPoolManager {
+    fn new(num_frames: usize, disk_manager: Arc<Mutex<DiskManager>>) -> Self {
+        let latch = Arc::new(Mutex::new(()));
+        let replacer = Arc::new(ArcReplacer::new(num_frames));
+        let disk_scheduler = Arc::new(DiskScheduler::new(disk_manager));
+
+        let _lock = latch.lock()
+
+        let next_page_id = AtomicUsize::new(0);
+
+        let mut frames = Vec::with_capacity(num_frames);
+        let mut free_frames = Vec::with_capacity(num_frames);
+        let mut page_table = HashMap::with_capacity(num_frames);
+
+        for i in 0..num_frames {
+            frames.push(FrameHeader::new(i as FrameId));
+            free_frames.push(i as FrameId);
+        }
+
+        Self {
+            num_frames,
+            next_page_id: 0,
+            arc_replacer: Arc::new(ArcReplacer::new(num_frames)),
+            disk_scheduler: Arc::new(DiskScheduler::new(disk_manager)),
+            frames,
+            free_frames,
+            latch: Arc::new(Mutex::new(())),
+            page_table,
+        }
+    }
+
+    fn get_pin_count(&self,  page_id: PageId) -> Option<usize> {
+        match self.page_table.get(&page_id) {
+            Some(frame_id) => {
+                Some(self.frames[*frame_id as usize].pin_count.load(Ordering::SeqCst))
+            }
+            None => {
+                None
+            }
+        }
+    }
 }
 
 // ============================================================================
