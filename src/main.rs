@@ -4,7 +4,7 @@ use std::fs::{remove_file, OpenOptions, File};
 use std::sync::{Mutex, Arc, mpsc, RwLock};
 use std::io::{self, Read, Write, SeekFrom, Seek };
 use std::thread;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
 
 type PageId = u32;
 type FrameId = u32;
@@ -878,20 +878,18 @@ mod disk_manager_tests {
 
 struct FrameHeader {
     frame_id: FrameId,
-    rw_latch: RwLock<()>,
     pin_count: AtomicUsize,
-    is_dirty: bool, // if false means no thread is currently using this frame its safe to evict or reuse
-    data: Vec<u8>,
+    is_dirty: AtomicBool, // if false means no thread is currently using this frame its safe to evict or reuse
+    data: RwLock<Vec<u8>>,
 }
 
 impl FrameHeader {
     fn new(frame_id: FrameId) -> Self {
         Self {
             frame_id,
-            rw_latch: RwLock::new(()),
             pin_count: AtomicUsize::new(0),
             is_dirty: false,
-            data: vec![0u8, PAGE_SIZE as u8],
+            data: RwLock::new(vec![0u8, PAGE_SIZE as u8]),
         }
     }
 
@@ -900,6 +898,79 @@ impl FrameHeader {
         // TODO: check if we can use Relaxed here and if it will affect the correctness of the program
         self.pin_count.store(0, Ordering::SeqCst);
         self.is_dirty = false;
+    }
+}
+
+// encapsulate the frames operations and lock it
+struct WritePageGuard {
+    page_id: PageId,
+    frame: Arc<FrameHeader>,
+    arc_replacer: Arc<ArcReplacer>,
+    bpm_latch: Arc<Mutex<()>>,
+    disk_scheduler: Arc<DiskScheduler>,
+    is_valid: bool,
+}
+
+
+impl WritePageGuard {
+    fn new(page_id: PageId, frame: Arc<FrameHeader>, 
+        arc_replacer: Arc<ArcReplacer>, bpm_latch: Arc<Mutex<()>>, 
+        disk_scheduler: Arc<DiskScheduler>) 
+    -> Self {
+        frame.pin_count.fetch_add(1, Ordering::SeqCst);
+        arc_replacer.set_evictable(frame.frame_id, false);
+        arc_replacer.record_access(frame.frame_id, page_id);
+
+        Self {
+            page_id, 
+            frame,
+            arc_replacer, 
+            bpm_latch,
+            disk_scheduler,
+            is_valid: true,
+        }
+    }
+
+    fn flush(&self) {
+        if !self.is_valid && !self.frame.is_dirty {
+            return;
+        }
+
+        let data = self.frame.data.read().unwrap().clone();
+
+        let (tx, rx) = mpsc::channel::<bool>();
+
+        self.disk_scheduler.schedule(DiskRequest {
+            r#type: DiskRequestType::Write,
+            page_id: self.page_id,
+            data,
+            promise: tx,
+        })
+
+        rx.recv().unwrap();
+
+        self.frame.is_dirty.store(false, Ordering::SeqCst);
+    }
+
+    pub fn data_mut(&mut self) -> LockResult<RwLockWriteGuard<'static, Vec<u8>>> {
+        self.frame.data.write()
+    }
+
+    pub fn data(&self) -> LockResult<RwLockReadGuard<'static, Vec<u8>>> {
+        self.frame.data.read()
+    }
+} 
+
+// drop trait now
+
+impl Drop for WritePageGuard {
+    fn drop(&mut self) {
+        self.frame.pin_count.fetch_sub(1, Ordering::SeqCst);
+        self.frame.is_dirty.store(true, Ordering::SeqCst);
+        self.is_valid = false;
+        if  self.frame.pin_count.load(Ordering::SeqCst) == 0 {
+            self.arc_replacer.set_evictable(self.frame.frame_id);
+        }
     }
 }
 /**
@@ -911,20 +982,19 @@ impl FrameHeader {
  */
 struct BufferPoolManager {
     num_frames: usize,
-    next_page_id: AtomicUsize,
+    next_page_id: AtomicU32,
     arc_replacer: Arc<ArcReplacer>,
     disk_scheduler: Arc<DiskScheduler>,
     frames: Vec<FrameHeader>,
     free_frames: Vec<FrameId>,
-    latch: Arc<Mutex<()>>
-    page_table: HashMap<PageId, FrameId>
+    latch: Arc<Mutex<()>>,
+    page_table: HashMap<PageId, FrameId>,
 }
-
 
 /**
  * functions implementation order 
- * 1. GetPinCount()
- * 2. NewPage()
+ * 1. GetPinCount() X
+ * 2. NewPage() X
  * 3. ReadPageGuard
  * 4. WritePageGuard
  * 5. CheckedReadPage()
@@ -936,9 +1006,9 @@ impl BufferPoolManager {
     fn new(num_frames: usize, disk_manager: Arc<Mutex<DiskManager>>) -> Self {
         let latch = Arc::new(Mutex::new(()));
         let replacer = Arc::new(ArcReplacer::new(num_frames));
-        let disk_scheduler = Arc::new(DiskScheduler::new(disk_manager));
+        let disk_scheduler = Arc::new(DiskScheduler::new(Arc::clone(&disk_manager)));
 
-        let _lock = latch.lock()
+        let _lock = latch.lock();
 
         let next_page_id = AtomicUsize::new(0);
 
@@ -953,9 +1023,9 @@ impl BufferPoolManager {
 
         Self {
             num_frames,
-            next_page_id: 0,
-            arc_replacer: Arc::new(ArcReplacer::new(num_frames)),
-            disk_scheduler: Arc::new(DiskScheduler::new(disk_manager)),
+            next_page_id: AtomicU32::new(0),
+            arc_replacer: replacer,
+            disk_scheduler,
             frames,
             free_frames,
             latch: Arc::new(Mutex::new(())),
@@ -973,8 +1043,23 @@ impl BufferPoolManager {
             }
         }
     }
-}
 
+    fn new_page(&self) -> PageId {
+        let _latch = self.latch.lock().unwrap();
+        let page_id = self.next_page_id.fetch_add(1, Ordering::SeqCst);
+
+        let (tx, rx) = mpsc::channel::<bool>();
+        self.disk_scheduler.schedule(DiskRequest {
+            r#type: DiskRequestType::Write,
+            page_id,
+            data: vec![0u8; PAGE_SIZE as usize],
+            promise: tx
+        });
+        rx.recv().unwrap();
+
+        page_id as u32
+    }
+}
 // ============================================================================
 // END OF SECTION 4: BUFFER POOL MANAGER
 // ============================================================================
