@@ -1,10 +1,10 @@
 use std::collections::{ HashMap, HashSet, VecDeque };
 use std::time::SystemTime;
 use std::fs::{remove_file, OpenOptions, File};
-use std::sync::{Mutex, Arc, mpsc, RwLock};
+use std::sync::{Mutex, Arc, mpsc, RwLock, RwLockReadGuard, RwLockWriteGuard, LockResult};
 use std::io::{self, Read, Write, SeekFrom, Seek };
 use std::thread;
-use std::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicU32, Ordering, AtomicBool};
 
 type PageId = u32;
 type FrameId = u32;
@@ -888,16 +888,16 @@ impl FrameHeader {
         Self {
             frame_id,
             pin_count: AtomicUsize::new(0),
-            is_dirty: false,
+            is_dirty: AtomicBool::new(false),
             data: RwLock::new(vec![0u8, PAGE_SIZE as u8]),
         }
     }
 
     fn reset(&mut self) {
-        self.data.fill(0);
+        self.data.write().unwrap().fill(0);
         // TODO: check if we can use Relaxed here and if it will affect the correctness of the program
         self.pin_count.store(0, Ordering::SeqCst);
-        self.is_dirty = false;
+        self.is_dirty.store(false, Ordering::SeqCst);
     }
 }
 
@@ -905,7 +905,7 @@ impl FrameHeader {
 struct WritePageGuard {
     page_id: PageId,
     frame: Arc<FrameHeader>,
-    arc_replacer: Arc<ArcReplacer>,
+    arc_replacer: Arc<Mutex<ArcReplacer>>,
     bpm_latch: Arc<Mutex<()>>,
     disk_scheduler: Arc<DiskScheduler>,
     is_valid: bool,
@@ -913,13 +913,16 @@ struct WritePageGuard {
 
 
 impl WritePageGuard {
-    fn new(page_id: PageId, frame: Arc<FrameHeader>, 
-        arc_replacer: Arc<ArcReplacer>, bpm_latch: Arc<Mutex<()>>, 
-        disk_scheduler: Arc<DiskScheduler>) 
+    fn new(
+        page_id: PageId, 
+        frame: Arc<FrameHeader>, 
+        arc_replacer: Arc<Mutex<ArcReplacer>>, 
+        bpm_latch: Arc<Mutex<()>>, 
+        disk_scheduler: Arc<DiskScheduler>
+    ) 
     -> Self {
         frame.pin_count.fetch_add(1, Ordering::SeqCst);
-        arc_replacer.set_evictable(frame.frame_id, false);
-        arc_replacer.record_access(frame.frame_id, page_id);
+        arc_replacer.lock().unwrap().record_access(frame.frame_id, page_id);
 
         Self {
             page_id, 
@@ -932,7 +935,7 @@ impl WritePageGuard {
     }
 
     fn flush(&self) {
-        if !self.is_valid && !self.frame.is_dirty {
+        if !self.is_valid && !self.frame.is_dirty.load(Ordering::SeqCst) {
             return;
         }
 
@@ -945,33 +948,44 @@ impl WritePageGuard {
             page_id: self.page_id,
             data,
             promise: tx,
-        })
+        });
 
         rx.recv().unwrap();
 
         self.frame.is_dirty.store(false, Ordering::SeqCst);
     }
 
-    pub fn data_mut(&mut self) -> LockResult<RwLockWriteGuard<'static, Vec<u8>>> {
+    pub fn data_mut(&mut self) -> LockResult<RwLockWriteGuard<'_, Vec<u8>>> {
         self.frame.data.write()
     }
 
-    pub fn data(&self) -> LockResult<RwLockReadGuard<'static, Vec<u8>>> {
+    pub fn data(&self) -> LockResult<RwLockReadGuard<'_, Vec<u8>>> {
         self.frame.data.read()
     }
 } 
 
-// drop trait now
-
 impl Drop for WritePageGuard {
     fn drop(&mut self) {
-        self.frame.pin_count.fetch_sub(1, Ordering::SeqCst);
-        self.frame.is_dirty.store(true, Ordering::SeqCst);
-        self.is_valid = false;
-        if  self.frame.pin_count.load(Ordering::SeqCst) == 0 {
-            self.arc_replacer.set_evictable(self.frame.frame_id);
+        if !self.is_valid {
+            return;
         }
+
+        self.frame.pin_count.fetch_sub(1, Ordering::SeqCst);
+        if  self.frame.pin_count.load(Ordering::SeqCst) == 0 {
+            self.arc_replacer.lock().unwrap().set_evictable(self.frame.frame_id);
+        }
+
+        self.is_valid = false;
     }
+}
+
+
+impl ReadPageGuard {
+
+}
+
+impl Drop for ReadPageGuard {
+    
 }
 /**
  * To Implement BufferPoolManager i need to
