@@ -1,7 +1,7 @@
 use std::collections::{ HashMap, HashSet, VecDeque };
 use std::time::SystemTime;
 use std::fs::{remove_file, OpenOptions, File};
-use std::sync::{Mutex, Arc, mpsc, RwLock, RwLockReadGuard, RwLockWriteGuard, LockResult};
+use std::sync::{Mutex, Arc, mpsc, RwLock, RwLockReadGuard, RwLockWriteGuard, LockResult, PoisonError};
 use std::io::{self, Read, Write, SeekFrom, Seek };
 use std::thread;
 use std::sync::atomic::{AtomicUsize, AtomicU32, Ordering, AtomicBool};
@@ -487,7 +487,7 @@ enum DiskRequestType {
 
 struct DiskRequest {
     r#type: DiskRequestType,
-    promise: mpsc::Sender<bool>,
+    promise: mpsc::Sender<Option<Vec<u8>>>,
     data: Vec<u8>,
     page_id: PageId,
 }
@@ -510,14 +510,14 @@ impl DiskScheduler {
                 match request.r#type {
                     DiskRequestType::Read => {
                         match dm.read_page(request.page_id, &mut request.data[..])  {
-                            Ok(_) => { let _ = request.promise.send(true);}
-                            Err(_) => { let _ = request.promise.send(false);}
+                            Ok(_) => { let _ = request.promise.send(Some(request.data));}
+                            Err(_) => { let _ = request.promise.send(None);}
                         }
                     }
                     DiskRequestType::Write => {
                         match dm.write_page(request.page_id, &request.data[..]) {
-                            Ok(_) => { let _ = request.promise.send(true);}
-                            Err(_) => { let _ = request.promise.send(false);}
+                            Ok(_) => { let _ = request.promise.send(Some(request.data));}
+                            Err(_) => { let _ = request.promise.send(None);}
                         }
                     }
                 }
@@ -893,7 +893,7 @@ impl FrameHeader {
         }
     }
 
-    fn reset(&mut self) {
+    fn reset(& self) {
         self.data.write().unwrap().fill(0);
         // TODO: check if we can use Relaxed here and if it will affect the correctness of the program
         self.pin_count.store(0, Ordering::SeqCst);
@@ -911,7 +911,6 @@ struct WritePageGuard {
     is_valid: bool,
 }
 
-
 impl WritePageGuard {
     fn new(
         page_id: PageId, 
@@ -919,8 +918,7 @@ impl WritePageGuard {
         arc_replacer: Arc<Mutex<ArcReplacer>>, 
         bpm_latch: Arc<Mutex<()>>, 
         disk_scheduler: Arc<DiskScheduler>
-    ) 
-    -> Self {
+    ) -> Self {
         frame.pin_count.fetch_add(1, Ordering::SeqCst);
         arc_replacer.lock().unwrap().record_access(frame.frame_id, page_id);
 
@@ -941,7 +939,7 @@ impl WritePageGuard {
 
         let data = self.frame.data.read().unwrap().clone();
 
-        let (tx, rx) = mpsc::channel::<bool>();
+        let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
 
         self.disk_scheduler.schedule(DiskRequest {
             r#type: DiskRequestType::Write,
@@ -979,27 +977,91 @@ impl Drop for WritePageGuard {
     }
 }
 
+struct ReadPageGuard {
+    page_id: PageId,
+    frame: Arc<FrameHeader>,
+    arc_replacer: Arc<Mutex<ArcReplacer>>,
+    bpm_latch: Arc<Mutex<()>>,
+    disk_scheduler: Arc<DiskScheduler>,
+    is_valid: bool,
+}
 
 impl ReadPageGuard {
 
+    fn new(
+        page_id: PageId, 
+        frame: Arc<FrameHeader>, 
+        arc_replacer: Arc<Mutex<ArcReplacer>>, 
+        bpm_latch: Arc<Mutex<()>>, 
+        disk_scheduler: Arc<DiskScheduler>
+    ) -> Self {
+        frame.pin_count.fetch_add(1, Ordering::SeqCst);
+        arc_replacer.lock().unwrap().record_access(frame.frame_id, page_id);
+
+        Self {
+            page_id, 
+            frame,
+            arc_replacer,
+            bpm_latch,
+            disk_scheduler,
+            is_valid: true,
+        }
+    }
+
+    fn data(&self) -> LockResult<RwLockReadGuard<'_, Vec<u8>>> {
+        return self.frame.data.read()
+    }
+
+    fn flush(&self) {
+        if !self.is_valid && !self.frame.is_dirty.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let data = self.frame.data.read().unwrap().clone();
+
+        let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
+
+        self.disk_scheduler.schedule(DiskRequest {
+            r#type: DiskRequestType::Write,
+            page_id: self.page_id,
+            data,
+            promise: tx,
+        });
+
+        rx.recv().unwrap();
+
+        self.frame.is_dirty.store(false, Ordering::SeqCst);
+    }
 }
 
 impl Drop for ReadPageGuard {
-    
+
+    fn drop(&mut self) {
+        if !self.is_valid {
+            return;
+        }
+
+        self.frame.pin_count.fetch_sub(1, Ordering::SeqCst);
+        if self.frame.pin_count.load(Ordering::SeqCst) == 0 {
+            self.arc_replacer.lock().unwrap().set_evictable(self.frame.frame_id);
+        }
+
+        self.is_valid = false;
+    }
 }
 /**
  * To Implement BufferPoolManager i need to
- *  - Read about RaII , Page Guards Write and Read then implement this
- *  - Read frame manager understand the role plan and implement a basic one and enahance it while implementing buffer pool manager
- *  - understand the conccuurency issues that we might face and plan how to solve it 
+ *  - Read about RaII , Page Guards Write and Read then implement this X
+ *  - Read frame manager understand the role plan and implement a basic one and enahance it while implementing buffer pool manager X
+ *  - understand the conccuurency issues that we might face and plan how to solve it X
  *  - Implement buffer pool manager with the frame manager and the disk manager
  */
 struct BufferPoolManager {
     num_frames: usize,
     next_page_id: AtomicU32,
-    arc_replacer: Arc<ArcReplacer>,
+    arc_replacer: Arc<Mutex<ArcReplacer>>,
     disk_scheduler: Arc<DiskScheduler>,
-    frames: Vec<FrameHeader>,
+    frames: Vec<Arc<FrameHeader>>,
     free_frames: Vec<FrameId>,
     latch: Arc<Mutex<()>>,
     page_table: HashMap<PageId, FrameId>,
@@ -1019,7 +1081,7 @@ struct BufferPoolManager {
 impl BufferPoolManager {
     fn new(num_frames: usize, disk_manager: Arc<Mutex<DiskManager>>) -> Self {
         let latch = Arc::new(Mutex::new(()));
-        let replacer = Arc::new(ArcReplacer::new(num_frames));
+        let replacer = Arc::new(Mutex::new(ArcReplacer::new(num_frames)));
         let disk_scheduler = Arc::new(DiskScheduler::new(Arc::clone(&disk_manager)));
 
         let _lock = latch.lock();
@@ -1031,7 +1093,7 @@ impl BufferPoolManager {
         let mut page_table = HashMap::with_capacity(num_frames);
 
         for i in 0..num_frames {
-            frames.push(FrameHeader::new(i as FrameId));
+            frames.push(Arc::new(FrameHeader::new(i as FrameId)));
             free_frames.push(i as FrameId);
         }
 
@@ -1062,7 +1124,7 @@ impl BufferPoolManager {
         let _latch = self.latch.lock().unwrap();
         let page_id = self.next_page_id.fetch_add(1, Ordering::SeqCst);
 
-        let (tx, rx) = mpsc::channel::<bool>();
+        let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
         self.disk_scheduler.schedule(DiskRequest {
             r#type: DiskRequestType::Write,
             page_id,
@@ -1072,6 +1134,236 @@ impl BufferPoolManager {
         rx.recv().unwrap();
 
         page_id as u32
+    }
+
+    fn delete_page(&self, page_id: PageId) {
+    
+    }
+ 
+    fn check_write_page(&mut self, page_id: PageId) -> Option<WritePageGuard>{
+        // TODO: check if we can not hold latch during async disk i/o operations
+        let _latch = self.latch.lock().unwrap();
+        // page is already in the buffer pool
+        if self.page_table.contains_key(&page_id) {
+            let frame_id = self.page_table[&page_id] as usize;
+            let frame = Arc::clone(&self.frames[frame_id]);
+            let write_guard = WritePageGuard::new(
+                page_id, 
+                frame,
+                Arc::clone(&self.arc_replacer),
+                Arc::clone(&self.latch),
+                Arc::clone(&self.disk_scheduler),
+            );
+
+            return Some(write_guard);
+        }
+
+        // page not in buffer pool and there is avaialable memory
+        if self.free_frames.len() > 0 {
+            let frame_id = self.free_frames.pop().unwrap();
+
+            let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
+            let data = vec![0u8, PAGE_SIZE as u8];
+
+            self.disk_scheduler.schedule(DiskRequest {
+                r#type: DiskRequestType::Read,
+                page_id,
+                data,
+                promise: tx,
+            });
+
+            let data = rx.recv().unwrap();
+
+            let frame = Arc::clone(&self.frames[frame_id as usize]);
+            self.page_table.insert(page_id, frame_id);
+            let mut write_guard = WritePageGuard::new(
+                page_id, 
+                frame,
+                Arc::clone(&self.arc_replacer),
+                Arc::clone(&self.latch),
+                Arc::clone(&self.disk_scheduler),
+            );
+
+            {
+                let mut frame_data = write_guard.data_mut().unwrap();
+                frame_data.copy_from_slice(&data.unwrap());
+            }
+
+            return Some(write_guard);
+
+        // page not in buffer pool and there is no available memory
+        } else {
+            // evict the old page
+            {
+                let frame_id = self.arc_replacer.lock().unwrap().evict().unwrap();
+                let frame = Arc::clone(&self.frames[frame_id as usize]);
+                
+                self.free_frames.push(frame_id);
+                let to_remove = self.page_table
+                .iter()
+                .find(move|&(_, &fid)| fid == frame_id)
+                .map(|(page_id, _)| *page_id);
+
+                let old_page_id = to_remove.expect("evicted frame must have a page id");
+                self.page_table.remove(&old_page_id);
+
+                let mut write_guard = WritePageGuard::new(
+                    old_page_id, 
+                    frame,
+                    Arc::clone(&self.arc_replacer),
+                    Arc::clone(&self.latch),
+                    Arc::clone(&self.disk_scheduler),
+                );
+
+                write_guard.flush();
+                let frame = Arc::clone(&self.frames[frame_id as usize]);
+                frame.reset();
+            }
+            // add the new page
+            let frame_id = self.free_frames.pop().unwrap();
+            let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
+
+            let data = vec![0u8, PAGE_SIZE as u8];
+
+            self.disk_scheduler.schedule(DiskRequest {
+                r#type: DiskRequestType::Read,
+                page_id,
+                data, 
+                promise: tx,
+            });
+
+            let data = rx.recv().unwrap();
+            let new_frame = Arc::clone(&self.frames[frame_id as usize]);
+            self.page_table.insert(page_id, frame_id);
+
+            let mut write_guard = WritePageGuard::new(
+                page_id,
+                new_frame,
+                Arc::clone(&self.arc_replacer),
+                Arc::clone(&self.latch),
+                Arc::clone(&self.disk_scheduler),
+            );
+
+            {
+                let mut frame_data = write_guard.data_mut().unwrap();
+                frame_data.copy_from_slice(&data.unwrap());
+            }
+
+            return Some(write_guard);
+        }
+    }
+
+    fn check_read_page(&mut self, page_id: PageId) -> Option<ReadPageGuard> {
+        // TODO: check if we can not hold latch during async disk i/o operations
+        let _latch = self.latch.lock().unwrap();
+
+        // page is already in the buffer pool
+        if self.page_table.contains_key(&page_id) {
+            let frame_id = self.page_table[&page_id] as usize;
+            let frame = Arc::clone(&self.frames[frame_id]);
+            let read_guard = ReadPageGuard::new(
+                page_id,
+                frame,
+                Arc::clone(&self.arc_replacer),
+                Arc::clone(&self.latch),
+                Arc::clone(&self.disk_scheduler),
+            );
+
+            return Some(read_guard);
+        }
+
+        // page not in buffer pool and there is available memory
+        if self.free_frames.len() > 0 {
+            let frame_id = self.free_frames.pop().unwrap();
+
+            let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
+            let data = vec![0u8, PAGE_SIZE as u8];
+
+            self.disk_scheduler.schedule(DiskRequest {
+                r#type: DiskRequestType::Read,
+                page_id,
+                data,
+                promise: tx,
+            });
+
+            let data = rx.recv().unwrap();
+
+            let frame = Arc::clone(&self.frames[frame_id as usize]);
+            self.page_table.insert(page_id, frame_id);
+            let mut read_guard = ReadPageGuard::new(
+                page_id,
+                frame,
+                Arc::clone(&self.arc_replacer),
+                Arc::clone(&self.latch),
+                Arc::clone(&self.disk_scheduler),
+            );
+
+            {
+                let mut frame_data = read_guard.data_mut().unwrap();
+                frame_data.copy_from_slice(&data.unwrap());
+            }
+
+            return Some(read_guard);
+
+        // page not in buffer pool and there is no available memory
+        } else {
+            {
+                let frame_id = self.arc_replacer.lock().unwrap().evict().unwrap();
+                let frame = Arc::clone(&self.frames[frame_id as usize]);
+
+                self.free_frames.push(frame_id);
+                let to_remove = self.page_table
+                .iter()
+                find(move|&(_, &fid)| fid == frame_id)
+                map(|(page_id, _)| *page_id);
+
+                let old_page_id = to_remove.expect("evicted frame must have a page id");
+                self.page_table.remove(&old_page_id);
+
+                let mut read_guard = ReadPageGuard::new(
+                    old_page_id,
+                    frame,
+                    Arc::clone(&self.arc_replacer),
+                    Arc::clone(&self.latch),
+                    Arc::clone(&self.disk_scheduler),
+                );
+
+                write_guard.flush();
+                let frame = Arc::clone(&self.frames[frame_id as usize]);
+                frame.reset();
+            }
+
+            let frame_id = self.free_frames.pop().unwrap();
+            let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
+
+            let data = vec![0u8, PAGE_SIZE as u8];
+
+            self.disk_scheduler.schedule(DiskRequest {
+                r#type: DiskRequestType::Read,
+                page_id,
+                data,
+                promise: tx,
+            });
+
+            let data = rx.recv().unwrap();
+            let new_frame = Arc::clone(&self.frames[frame_id as usize]);
+            self.page_table.insert(page_id, frame_id);
+
+            let mut read_guard = ReadPageGuard::new(
+                page_id,
+                new_frame,
+                Arc::clone(&self.arc_replacer),
+                Arc::clone(&self.latch),
+                Arc::clone(&self.disk_scheduler),
+            );
+
+            {
+                let mut frame_data = read_guard.data_mut().unwrap();
+                frame_data.copy_from_slice(&data.unwrap());
+            }
+
+            return Some(write_guard);
+        }
     }
 }
 // ============================================================================
