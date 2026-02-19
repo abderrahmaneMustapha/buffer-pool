@@ -194,9 +194,6 @@ impl ArcReplacer {
         None
     }
 
-    // UNDERSTAND THE WHY AND HOW BEHIND THIS FUNCTION
-    // not sure wtf this does lets keep it, later lets read more and understand how to it works
-    // implemented this translating english to rust
     fn remove(&mut self, frame_id: u32) {
 
         if self.evictable_pages.contains(&frame_id) {
@@ -483,6 +480,7 @@ mod arc_replacer_tests {
 enum DiskRequestType {
     Read,
     Write,
+    Delete,
 }
 
 struct DiskRequest {
@@ -516,6 +514,12 @@ impl DiskScheduler {
                     }
                     DiskRequestType::Write => {
                         match dm.write_page(request.page_id, &request.data[..]) {
+                            Ok(_) => { let _ = request.promise.send(Some(request.data));}
+                            Err(_) => { let _ = request.promise.send(None);}
+                        }
+                    }
+                    DiskRequestType::Delete => {
+                        match dm.delete_page(request.page_id) {
                             Ok(_) => { let _ = request.promise.send(Some(request.data));}
                             Err(_) => { let _ = request.promise.send(None);}
                         }
@@ -1135,9 +1139,32 @@ impl BufferPoolManager {
 
         page_id as u32
     }
+ 
+    fn delete_page(&mut self, page_id: PageId) { 
+        let _latch = self.latch.lock().unwrap();
+        if self.page_table.contains_key(&page_id) {
+            let frame_id = self.page_table[&page_id] as usize;
+            let frame = Arc::clone(&self.frames[frame_id]);
 
-    fn delete_page(&self, page_id: PageId) {
-    
+            if(frame.pin_count.load(Ordering::SeqCst) > 0) {
+                return;
+            }
+
+            self.page_table.remove(&page_id);
+            self.arc_replacer.lock().unwrap().remove(frame_id as FrameId);
+            frame.reset();
+            self.free_frames.push(frame_id as FrameId);
+
+            let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
+            let data = vec![0u8, PAGE_SIZE as u8];
+            self.disk_scheduler.schedule(DiskRequest {
+                r#type: DiskRequestType::Delete,
+                page_id,
+                data,
+                promise: tx,
+            });
+            let _ = rx.recv().unwrap();
+        }
     }
  
     fn check_write_page(&mut self, page_id: PageId) -> Option<WritePageGuard>{
@@ -1175,6 +1202,9 @@ impl BufferPoolManager {
             let data = rx.recv().unwrap();
 
             let frame = Arc::clone(&self.frames[frame_id as usize]);
+
+            frame.data.write().unwrap().copy_from_slice(&data.unwrap());
+
             self.page_table.insert(page_id, frame_id);
             let mut write_guard = WritePageGuard::new(
                 page_id, 
@@ -1183,11 +1213,6 @@ impl BufferPoolManager {
                 Arc::clone(&self.latch),
                 Arc::clone(&self.disk_scheduler),
             );
-
-            {
-                let mut frame_data = write_guard.data_mut().unwrap();
-                frame_data.copy_from_slice(&data.unwrap());
-            }
 
             return Some(write_guard);
 
@@ -1234,6 +1259,9 @@ impl BufferPoolManager {
 
             let data = rx.recv().unwrap();
             let new_frame = Arc::clone(&self.frames[frame_id as usize]);
+
+            new_frame.data.write().unwrap().copy_from_slice(&data.unwrap());
+
             self.page_table.insert(page_id, frame_id);
 
             let mut write_guard = WritePageGuard::new(
@@ -1244,10 +1272,7 @@ impl BufferPoolManager {
                 Arc::clone(&self.disk_scheduler),
             );
 
-            {
-                let mut frame_data = write_guard.data_mut().unwrap();
-                frame_data.copy_from_slice(&data.unwrap());
-            }
+          
 
             return Some(write_guard);
         }
@@ -1289,6 +1314,7 @@ impl BufferPoolManager {
             let data = rx.recv().unwrap();
 
             let frame = Arc::clone(&self.frames[frame_id as usize]);
+            frame.data.write().unwrap().copy_from_slice(&data.unwrap());
             self.page_table.insert(page_id, frame_id);
             let mut read_guard = ReadPageGuard::new(
                 page_id,
@@ -1297,11 +1323,6 @@ impl BufferPoolManager {
                 Arc::clone(&self.latch),
                 Arc::clone(&self.disk_scheduler),
             );
-
-            {
-                let mut frame_data = read_guard.data_mut().unwrap();
-                frame_data.copy_from_slice(&data.unwrap());
-            }
 
             return Some(read_guard);
 
@@ -1314,8 +1335,8 @@ impl BufferPoolManager {
                 self.free_frames.push(frame_id);
                 let to_remove = self.page_table
                 .iter()
-                find(move|&(_, &fid)| fid == frame_id)
-                map(|(page_id, _)| *page_id);
+                .find(move|&(_, &fid)| fid == frame_id)
+                .map(|(page_id, _)| *page_id);
 
                 let old_page_id = to_remove.expect("evicted frame must have a page id");
                 self.page_table.remove(&old_page_id);
@@ -1328,7 +1349,7 @@ impl BufferPoolManager {
                     Arc::clone(&self.disk_scheduler),
                 );
 
-                write_guard.flush();
+                read_guard.flush();
                 let frame = Arc::clone(&self.frames[frame_id as usize]);
                 frame.reset();
             }
@@ -1347,8 +1368,11 @@ impl BufferPoolManager {
 
             let data = rx.recv().unwrap();
             let new_frame = Arc::clone(&self.frames[frame_id as usize]);
-            self.page_table.insert(page_id, frame_id);
 
+            new_frame.data.write().unwrap().copy_from_slice(&data.unwrap());
+            
+            self.page_table.insert(page_id, frame_id);
+            
             let mut read_guard = ReadPageGuard::new(
                 page_id,
                 new_frame,
@@ -1357,13 +1381,54 @@ impl BufferPoolManager {
                 Arc::clone(&self.disk_scheduler),
             );
 
-            {
-                let mut frame_data = read_guard.data_mut().unwrap();
-                frame_data.copy_from_slice(&data.unwrap());
-            }
-
-            return Some(write_guard);
+            return Some(read_guard);
         }
+    }
+
+    fn flush_page(&mut self, page_id: PageId) -> bool {
+        let _latch = self.latch.lock().unwrap();
+
+        if self.page_table.contains_key(&page_id) {
+            let frame_id = self.page_table[&page_id] as usize;
+            let frame = Arc::clone(&self.frames[frame_id]);
+            
+            let read_page_guard = ReadPageGuard::new(
+                page_id,
+                frame,
+                Arc::clone(&self.arc_replacer),
+                Arc::clone(&self.latch),
+                Arc::clone(&self.disk_scheduler),
+            );
+
+            read_page_guard.flush();
+
+            return true;
+        }
+
+        return false;
+    }
+
+    fn flush_all_pages(&mut self) -> bool {
+        let _latch = self.latch.lock().unwrap();
+
+        if self.page_table.is_empty() {
+            return false;
+        } 
+
+        for (page_id, frame_id) in self.page_table.iter() {
+            let frame = Arc::clone(&self.frames[*frame_id as usize]);
+            let read_page_guard = ReadPageGuard::new(
+                *page_id,
+                frame,
+                Arc::clone(&self.arc_replacer),
+                Arc::clone(&self.latch),
+                Arc::clone(&self.disk_scheduler)
+            );
+
+            read_page_guard.flush();
+        }
+
+        return true;
     }
 }
 // ============================================================================
