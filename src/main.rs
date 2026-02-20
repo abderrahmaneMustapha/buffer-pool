@@ -1,7 +1,7 @@
 use std::collections::{ HashMap, HashSet, VecDeque };
 use std::time::SystemTime;
 use std::fs::{remove_file, OpenOptions, File};
-use std::sync::{Mutex, Arc, mpsc, RwLock, RwLockReadGuard, RwLockWriteGuard, LockResult, PoisonError};
+use std::sync::{Mutex, Arc, mpsc, RwLock, RwLockReadGuard, RwLockWriteGuard, LockResult};
 use std::io::{self, Read, Write, SeekFrom, Seek };
 use std::thread;
 use std::sync::atomic::{AtomicUsize, AtomicU32, Ordering, AtomicBool};
@@ -565,7 +565,7 @@ mod disk_scheduler_tests {
         let page_data = b"Hello world".repeat(PAGE_SIZE / 10);
         let page_data = &page_data[..PAGE_SIZE];
 
-        let (tx1, rx1 ) = mpsc::channel::<bool>();
+        let (tx1, rx1 ) = mpsc::channel::<Option<Vec<u8>>>();
         let req1 = DiskRequest {
            r#type: DiskRequestType::Write,
            page_id: 0,
@@ -574,9 +574,9 @@ mod disk_scheduler_tests {
         };
 
         scheduler.schedule(req1);
-        assert!(rx1.recv().unwrap());
+        assert_eq!(rx1.recv().unwrap(), Some(page_data.to_vec()));
 
-        let (tx2, rx2) = mpsc::channel::<bool>();
+        let (tx2, rx2) = mpsc::channel::<Option<Vec<u8>>>();
         let req2 = DiskRequest {
             r#type: DiskRequestType::Read,
             page_id: 1,
@@ -585,7 +585,7 @@ mod disk_scheduler_tests {
         };
 
         scheduler.schedule(req2);
-        assert!(rx2.recv().unwrap());
+        assert_eq!(rx2.recv().unwrap(), Some(page_data.to_vec()));
 
         let _ = remove_file(test_file);
     }
@@ -893,7 +893,7 @@ impl FrameHeader {
             frame_id,
             pin_count: AtomicUsize::new(0),
             is_dirty: AtomicBool::new(false),
-            data: RwLock::new(vec![0u8, PAGE_SIZE as u8]),
+            data: RwLock::new(vec![0u8; PAGE_SIZE]),
         }
     }
 
@@ -936,9 +936,9 @@ impl WritePageGuard {
         }
     }
 
-    fn flush(&self) {
-        if !self.is_valid && !self.frame.is_dirty.load(Ordering::SeqCst) {
-            return;
+    fn flush(&self) -> bool {
+        if !self.is_valid || !self.frame.is_dirty.load(Ordering::SeqCst) {
+            return false;
         }
 
         let data = self.frame.data.read().unwrap().clone();
@@ -955,6 +955,8 @@ impl WritePageGuard {
         rx.recv().unwrap();
 
         self.frame.is_dirty.store(false, Ordering::SeqCst);
+
+        return true;
     }
 
     pub fn data_mut(&mut self) -> LockResult<RwLockWriteGuard<'_, Vec<u8>>> {
@@ -1016,9 +1018,9 @@ impl ReadPageGuard {
         return self.frame.data.read()
     }
 
-    fn flush(&self) {
-        if !self.is_valid && !self.frame.is_dirty.load(Ordering::SeqCst) {
-            return;
+    fn flush(&self) -> bool {
+        if !self.is_valid || !self.frame.is_dirty.load(Ordering::SeqCst) {
+            return false;
         }
 
         let data = self.frame.data.read().unwrap().clone();
@@ -1035,6 +1037,7 @@ impl ReadPageGuard {
         rx.recv().unwrap();
 
         self.frame.is_dirty.store(false, Ordering::SeqCst);
+        return true;
     }
 }
 
@@ -1090,11 +1093,11 @@ impl BufferPoolManager {
 
         let _lock = latch.lock();
 
-        let next_page_id = AtomicUsize::new(0);
+        let next_page_id = AtomicU32::new(0);
 
         let mut frames = Vec::with_capacity(num_frames);
         let mut free_frames = Vec::with_capacity(num_frames);
-        let mut page_table = HashMap::with_capacity(num_frames);
+        let page_table = HashMap::with_capacity(num_frames);
 
         for i in 0..num_frames {
             frames.push(Arc::new(FrameHeader::new(i as FrameId)));
@@ -1103,7 +1106,7 @@ impl BufferPoolManager {
 
         Self {
             num_frames,
-            next_page_id: AtomicU32::new(0),
+            next_page_id,
             arc_replacer: replacer,
             disk_scheduler,
             frames,
@@ -1146,7 +1149,7 @@ impl BufferPoolManager {
             let frame_id = self.page_table[&page_id] as usize;
             let frame = Arc::clone(&self.frames[frame_id]);
 
-            if(frame.pin_count.load(Ordering::SeqCst) > 0) {
+            if frame.pin_count.load(Ordering::SeqCst) > 0 {
                 return;
             }
 
@@ -1156,7 +1159,7 @@ impl BufferPoolManager {
             self.free_frames.push(frame_id as FrameId);
 
             let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
-            let data = vec![0u8, PAGE_SIZE as u8];
+            let data = vec![0u8; PAGE_SIZE];
             self.disk_scheduler.schedule(DiskRequest {
                 r#type: DiskRequestType::Delete,
                 page_id,
@@ -1190,8 +1193,7 @@ impl BufferPoolManager {
             let frame_id = self.free_frames.pop().unwrap();
 
             let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
-            let data = vec![0u8, PAGE_SIZE as u8];
-
+            let data = vec![0u8; PAGE_SIZE];
             self.disk_scheduler.schedule(DiskRequest {
                 r#type: DiskRequestType::Read,
                 page_id,
@@ -1206,7 +1208,7 @@ impl BufferPoolManager {
             frame.data.write().unwrap().copy_from_slice(&data.unwrap());
 
             self.page_table.insert(page_id, frame_id);
-            let mut write_guard = WritePageGuard::new(
+            let write_guard = WritePageGuard::new(
                 page_id, 
                 frame,
                 Arc::clone(&self.arc_replacer),
@@ -1232,7 +1234,7 @@ impl BufferPoolManager {
                 let old_page_id = to_remove.expect("evicted frame must have a page id");
                 self.page_table.remove(&old_page_id);
 
-                let mut write_guard = WritePageGuard::new(
+                let write_guard = WritePageGuard::new(
                     old_page_id, 
                     frame,
                     Arc::clone(&self.arc_replacer),
@@ -1248,7 +1250,7 @@ impl BufferPoolManager {
             let frame_id = self.free_frames.pop().unwrap();
             let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
 
-            let data = vec![0u8, PAGE_SIZE as u8];
+            let data = vec![0u8; PAGE_SIZE];
 
             self.disk_scheduler.schedule(DiskRequest {
                 r#type: DiskRequestType::Read,
@@ -1264,7 +1266,7 @@ impl BufferPoolManager {
 
             self.page_table.insert(page_id, frame_id);
 
-            let mut write_guard = WritePageGuard::new(
+            let write_guard = WritePageGuard::new(
                 page_id,
                 new_frame,
                 Arc::clone(&self.arc_replacer),
@@ -1302,7 +1304,7 @@ impl BufferPoolManager {
             let frame_id = self.free_frames.pop().unwrap();
 
             let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
-            let data = vec![0u8, PAGE_SIZE as u8];
+            let data = vec![0u8; PAGE_SIZE];
 
             self.disk_scheduler.schedule(DiskRequest {
                 r#type: DiskRequestType::Read,
@@ -1316,7 +1318,7 @@ impl BufferPoolManager {
             let frame = Arc::clone(&self.frames[frame_id as usize]);
             frame.data.write().unwrap().copy_from_slice(&data.unwrap());
             self.page_table.insert(page_id, frame_id);
-            let mut read_guard = ReadPageGuard::new(
+            let read_guard = ReadPageGuard::new(
                 page_id,
                 frame,
                 Arc::clone(&self.arc_replacer),
@@ -1341,7 +1343,7 @@ impl BufferPoolManager {
                 let old_page_id = to_remove.expect("evicted frame must have a page id");
                 self.page_table.remove(&old_page_id);
 
-                let mut read_guard = ReadPageGuard::new(
+                let read_guard = ReadPageGuard::new(
                     old_page_id,
                     frame,
                     Arc::clone(&self.arc_replacer),
@@ -1357,7 +1359,7 @@ impl BufferPoolManager {
             let frame_id = self.free_frames.pop().unwrap();
             let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
 
-            let data = vec![0u8, PAGE_SIZE as u8];
+            let data = vec![0u8; PAGE_SIZE];
 
             self.disk_scheduler.schedule(DiskRequest {
                 r#type: DiskRequestType::Read,
@@ -1373,7 +1375,7 @@ impl BufferPoolManager {
             
             self.page_table.insert(page_id, frame_id);
             
-            let mut read_guard = ReadPageGuard::new(
+            let read_guard = ReadPageGuard::new(
                 page_id,
                 new_frame,
                 Arc::clone(&self.arc_replacer),
@@ -1400,9 +1402,7 @@ impl BufferPoolManager {
                 Arc::clone(&self.disk_scheduler),
             );
 
-            read_page_guard.flush();
-
-            return true;
+            return read_page_guard.flush();
         }
 
         return false;
@@ -1429,6 +1429,52 @@ impl BufferPoolManager {
         }
 
         return true;
+    }
+}
+
+mod buffer_pool_manager_tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_read_write_delete_operation() {
+        let mut bpm = BufferPoolManager::new(10, Arc::new(Mutex::new(DiskManager::new("test.db"))));
+        let page_id = bpm.new_page();
+
+        let mut write_guard = bpm.check_write_page(page_id).unwrap();
+        write_guard.data_mut().unwrap().fill(1);
+
+        let read_guard = bpm.check_read_page(page_id).unwrap();
+        let data = read_guard.data().unwrap();
+
+        assert_eq!(data.as_slice(), &[1; PAGE_SIZE]);
+        assert_eq!(bpm.get_pin_count(page_id).unwrap(), 2);
+
+        read_guard.frame.is_dirty.store(false, Ordering::SeqCst);
+        
+        assert_eq!(bpm.flush_page(page_id), false);
+
+        read_guard.frame.is_dirty.store(true, Ordering::SeqCst);
+
+        assert_eq!(bpm.flush_page(page_id), true);
+
+        let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
+        bpm.disk_scheduler.schedule(DiskRequest {
+            r#type: DiskRequestType::Read,
+            page_id: page_id,
+            data: vec![0u8; PAGE_SIZE],
+            promise: tx,
+        });
+
+        let data_from_disk = rx.recv().unwrap();
+        assert_eq!(data_from_disk.unwrap().as_slice(), &[1u8; PAGE_SIZE]);
+    }
+
+    #[test]
+    fn test_multiple_threads_read_write_delete_operations() {
+        let bpm = BufferPoolManager::new(10, Arc::new(Mutex::new(DiskManager::new("test.db"))));
+        // create multiple pages 
+        println!("bpm {:?}", bpm.page_table.len());
+        // read and wirte delete operations on different threads
     }
 }
 // ============================================================================
