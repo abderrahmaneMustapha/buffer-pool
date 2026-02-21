@@ -63,6 +63,7 @@ impl WritePageGuard {
     }
 
     pub fn data_mut(&mut self) -> LockResult<RwLockWriteGuard<'_, Vec<u8>>> {
+        self.frame.is_dirty.store(true, Ordering::SeqCst);
         self.frame.data.write()
     }
 
