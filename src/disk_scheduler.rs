@@ -6,11 +6,12 @@
 // Uses background worker thread to process queued requests
 // ============================================================================
 
-use crate::common::{ PageId };
+use crate::common::{ PageId, PAGE_SIZE };
 use crate::disk_manager::DiskManager;
 use std::sync::{Mutex, Arc};
 use std::thread;
 use std::sync::mpsc;
+use std::fs::{remove_file};
 
 pub enum DiskRequestType {
     Read,
@@ -114,7 +115,7 @@ mod disk_scheduler_tests {
         let (tx2, rx2) = mpsc::channel::<Option<Vec<u8>>>();
         let req2 = DiskRequest {
             r#type: DiskRequestType::Read,
-            page_id: 1,
+            page_id: 0,
             data: page_data.to_vec(),
             promise: tx2,
         };

@@ -10,7 +10,7 @@
 use std::collections::{ HashMap };
 use crate::common::{ PageId, PAGE_SIZE, DB_IO_SIZE };
 use std::sync::{Mutex};
-use std::fs::{OpenOptions, File};
+use std::fs::{OpenOptions, File, remove_file};
 use std::io::{self, Read, Write, SeekFrom, Seek};
 
 pub struct DiskManager {

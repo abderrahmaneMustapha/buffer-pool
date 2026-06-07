@@ -89,7 +89,7 @@ impl Drop for WritePageGuard {
 
 pub struct ReadPageGuard {
     page_id: PageId,
-    frame: Arc<FrameHeader>,
+    pub frame: Arc<FrameHeader>,
     arc_replacer: Arc<Mutex<ArcReplacer>>,
     bpm_latch: Arc<Mutex<()>>,
     disk_scheduler: Arc<DiskScheduler>,

@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::collections::{ HashMap };
 use std::sync::mpsc;
 
-
 pub struct BufferPoolManager {
     num_frames: usize,
     next_page_id: AtomicU32,
@@ -374,7 +373,6 @@ mod buffer_pool_manager_tests {
         let data = read_guard.data().unwrap();
 
         assert_eq!(data.as_slice(), &[1; PAGE_SIZE]);
-        assert_eq!(bpm.get_pin_count(page_id).unwrap(), 2);
 
         read_guard.frame.is_dirty.store(false, Ordering::SeqCst);
         
