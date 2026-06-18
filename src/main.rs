@@ -5,6 +5,7 @@ mod disk_scheduler;
 mod frame_header;
 mod guard;
 mod buffer_pool;
+mod b_plus_tree;
 
 use crate::buffer_pool::BufferPoolManager;
 use crate::disk_manager::DiskManager;
