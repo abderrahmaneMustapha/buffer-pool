@@ -92,7 +92,7 @@ mod disk_scheduler_tests {
 
     #[test]
     fn test_basic_read_write_operations() {
-        let test_file = "test.db";
+        let test_file = "test_disk_scheduler_basic.db";
         let _ = remove_file(test_file);
         let dm = Arc::new(Mutex::new(DiskManager::new(test_file)));
         let scheduler = DiskScheduler::new(dm);

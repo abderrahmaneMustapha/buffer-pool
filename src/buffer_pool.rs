@@ -169,8 +169,7 @@ impl BufferPoolManager {
                 );
 
                 write_guard.flush();
-                let frame = Arc::clone(&self.frames[frame_id as usize]);
-                frame.reset();
+                self.frames[frame_id as usize].reset();
             }
             // add the new page
             let frame_id = self.free_frames.pop().unwrap();
@@ -278,8 +277,7 @@ impl BufferPoolManager {
                 );
 
                 read_guard.flush();
-                let frame = Arc::clone(&self.frames[frame_id as usize]);
-                frame.reset();
+                self.frames[frame_id as usize].reset();
             }
 
             let frame_id = self.free_frames.pop().unwrap();
@@ -363,7 +361,7 @@ mod buffer_pool_manager_tests {
 
     #[test]
     fn test_basic_read_write_delete_operation() {
-        let mut bpm = BufferPoolManager::new(10, Arc::new(Mutex::new(DiskManager::new("test.db"))));
+        let mut bpm = BufferPoolManager::new(10, Arc::new(Mutex::new(DiskManager::new("test_bpm_basic.db"))));
         let page_id = bpm.new_page();
 
         let mut write_guard = bpm.check_write_page(page_id).unwrap();
@@ -397,7 +395,7 @@ mod buffer_pool_manager_tests {
     // TODO: test multiple threads read and write operations not now do it later i need to continue studying other database components
     #[test]
     fn test_multiple_threads_read_write_delete_operations() {
-        let bpm = BufferPoolManager::new(10, Arc::new(Mutex::new(DiskManager::new("test.db"))));
+        let bpm = BufferPoolManager::new(10, Arc::new(Mutex::new(DiskManager::new("test_bpm_multithread.db"))));
         // create multiple pages 
         println!("bpm {:?}", bpm.page_table.len());
         // read and wirte delete operations on different threads

@@ -183,7 +183,7 @@ mod disk_manager_tests {
 
     #[test]
     fn test_basic_write_read_delete_operations() {
-        let test_file = "test.db";
+        let test_file = "test_basic_write_read_delete.db";
         let _ = remove_file(test_file);
 
         let mut dm = DiskManager::new(test_file);
@@ -213,7 +213,7 @@ mod disk_manager_tests {
     
     #[test]
     fn test_use_existing_slot() {
-        let test_file =  "test.db";
+        let test_file =  "test_use_existing_slot.db";
         let _ = remove_file(test_file);
 
         let mut dm = DiskManager::new(test_file);
@@ -258,7 +258,7 @@ mod disk_manager_tests {
 
     #[test]
     fn test_increase_page_capacity() {
-        let test_file = "test.db";
+        let test_file = "test_increase_page_capacity.db";
         let _ = remove_file(test_file);
 
         let mut dm = DiskManager::new(test_file);
