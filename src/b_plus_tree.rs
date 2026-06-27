@@ -9,7 +9,7 @@ use crate::common::PageId;
 use std::sync::{Arc, Mutex};
 
 const DEFAULT_LEAF_NODE_MAX_SIZE: u32 = 511;
-const DEFAULT_INNER_NODE_MAX_SIZE: u32 = 681;
+const DEFAULT_INTERNAL_NODE_MAX_SIZE: u32 = 681;
 const HEADER_SIZE: usize = 16;
 
 type Key = i64;
@@ -90,6 +90,44 @@ impl LeafNode {
 }
 
 
+impl InternalNode {
+
+    fn decode(bytes: &[u8]) -> InternalNode {
+        let current_size = u32::from_le_bytes(bytes[4 .. 8].try_into().unwrap());
+
+        let mut entries = Vec::with_capacity(current_size as usize);
+        let mut off = HEADER_SIZE;
+
+        for _ in 0 .. current_size {
+            let key = Key::from_le_bytes(bytes[off .. off+8].try_into().unwrap());
+            let pid = u32::from_le_bytes(bytes[off+8 .. off+12].try_into().unwrap());
+
+            entries.push((key, pid));
+            off += 12
+        }
+
+        InternalNode { entries }
+    }
+
+
+    fn encode(&self, bytes: &mut [u8]) {
+        bytes[0] = 0;
+
+        bytes[4 .. 8].copy_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        bytes[8 .. 12].copy_from_slice(&DEFAULT_INTERNAL_NODE_MAX_SIZE.to_le_bytes());
+
+        // skip the first slot in the internal node
+        let mut off = HEADER_SIZE;
+
+        for (key, pid) in &self.entries {
+            bytes[off .. off + 8].copy_from_slice(&key.to_le_bytes());
+            bytes[off + 8 .. off + 12].copy_from_slice(&pid.to_le_bytes());
+
+            off += 12
+        }
+    }
+}
+
 
 
 #[cfg(test)]
@@ -98,7 +136,7 @@ mod b_plus_tree_testing {
 
     #[test]
     fn basic_leaf_encode_decode() {
-        let mut bytes:&mut[u8] =  &mut [0; DEFAULT_INNER_NODE_MAX_SIZE as usize];
+        let mut bytes:&mut[u8] =  &mut [0; DEFAULT_LEAF_NODE_MAX_SIZE as usize];
 
         let leaf = LeafNode {
             next_page_id: 2,
@@ -114,5 +152,25 @@ mod b_plus_tree_testing {
 
         assert_eq!(leaf.next_page_id, decoded_leaf.next_page_id);
         assert_eq!(leaf.entries.len(), decoded_leaf.entries.len());
+    }
+
+    #[test]
+    fn basic_internal_encode_decode() {
+        let mut bytes:&mut[u8] = &mut [0; DEFAULT_INTERNAL_NODE_MAX_SIZE as usize];
+
+        let internal = InternalNode {
+            entries: vec![
+                (1, 11),
+                (2, 12),
+                (3, 13),
+            ]
+        };
+
+        internal.encode(bytes);
+
+        let decoded_internal = InternalNode::decode(bytes);
+
+        assert_eq!(internal.entries.len(), decoded_internal.entries.len());
+        assert_eq!(internal.entries.first(), decoded_internal.entries.first());
     }
 }
