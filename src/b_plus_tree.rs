@@ -14,7 +14,7 @@ const HEADER_SIZE: usize = 16;
 
 type Key = i64;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RecordId {
     pub page_id: PageId,
     pub slot_num: u32,
@@ -41,6 +41,7 @@ pub struct BTree {
 
  
 impl LeafNode {
+
     fn decode(bytes: &[u8]) -> LeafNode {
         // get current size from the 4th to 8th bytes
         let current_size = u32::from_le_bytes(bytes[4 .. 8].try_into().unwrap());
@@ -56,7 +57,7 @@ impl LeafNode {
         for _ in 0 .. current_size {
         // inside the loop do the following
           // - get the key from start jump with 8 bytes => we are expecting this to be big
-          let key = Key::from_le_bytes(bytes[off .. off+8].try_into().unwrap());
+          let key = i64::from_le_bytes(bytes[off .. off+8].try_into().unwrap());
           // - get the pid from jump with 4 bytes => with this 32 bits we can go up  to 4 bilion so that is great
           let page_id = u32::from_le_bytes(bytes[off+8 .. off+12].try_into().unwrap());
           // - get the slot jump with 4 bytes => same here 4 bilion slots for a one page
@@ -99,7 +100,7 @@ impl InternalNode {
         let mut off = HEADER_SIZE;
 
         for _ in 0 .. current_size {
-            let key = Key::from_le_bytes(bytes[off .. off+8].try_into().unwrap());
+            let key = i64::from_le_bytes(bytes[off .. off+8].try_into().unwrap());
             let pid = u32::from_le_bytes(bytes[off+8 .. off+12].try_into().unwrap());
 
             entries.push((key, pid));
@@ -128,6 +129,15 @@ impl InternalNode {
     }
 }
 
+impl BTree {
+    fn get_root_page_id(&mut self, bytes: &[u8]) -> PageId {
+        u32::from_le_bytes(bytes[0 .. 4].try_into().unwrap())
+    }
+
+    fn set_root_page_id(&self , bytes: &mut[u8]) {
+        bytes[0 .. 4].copy_from_slice(&self.root_page_id.to_le_bytes());
+    }
+}
 
 
 #[cfg(test)]
@@ -152,6 +162,7 @@ mod b_plus_tree_testing {
 
         assert_eq!(leaf.next_page_id, decoded_leaf.next_page_id);
         assert_eq!(leaf.entries.len(), decoded_leaf.entries.len());
+        assert_eq!(leaf.entries, decoded_leaf.entries);
     }
 
     #[test]
@@ -171,6 +182,6 @@ mod b_plus_tree_testing {
         let decoded_internal = InternalNode::decode(bytes);
 
         assert_eq!(internal.entries.len(), decoded_internal.entries.len());
-        assert_eq!(internal.entries.first(), decoded_internal.entries.first());
+        assert_eq!(internal.entries, decoded_internal.entries);
     }
 }
