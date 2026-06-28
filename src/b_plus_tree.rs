@@ -5,12 +5,14 @@
 // ============================================================================
 use crate::buffer_pool::BufferPoolManager;
 use crate::disk_manager::DiskManager;
-use crate::common::PageId;
+use crate::common::{PageId, INVALID_PAGE_ID};
 use std::sync::{Arc, Mutex};
 
 const DEFAULT_LEAF_NODE_MAX_SIZE: u32 = 511;
 const DEFAULT_INTERNAL_NODE_MAX_SIZE: u32 = 681;
 const HEADER_SIZE: usize = 16;
+// this is a temporary default slot number placeholder until we build a the table page
+const DEFAULT_SLOT_NUMBER: u32 = 0;
 
 type Key = i64;
 
@@ -33,10 +35,9 @@ struct InternalNode {
 }
 
 pub struct BTree {
+    header_page_id: PageId, 
     root_page_id: PageId,
     buffer_pool: BufferPoolManager,
-    max_leaf_size: u32,
-    max_internal_size: u32,
 }
 
  
@@ -130,12 +131,53 @@ impl InternalNode {
 }
 
 impl BTree {
+
+    pub fn new() -> Self {
+        let buffer_pool = BufferPoolManager::new(10, Arc::new(Mutex::new( DiskManager::new("main.db"))));
+        let header_page_id = buffer_pool.new_page();
+
+        Self {
+            header_page_id,
+            buffer_pool,
+            root_page_id: INVALID_PAGE_ID,
+        }
+    }
+
     fn get_root_page_id(&mut self, bytes: &[u8]) -> PageId {
         u32::from_le_bytes(bytes[0 .. 4].try_into().unwrap())
     }
 
     fn set_root_page_id(&self , bytes: &mut[u8]) {
         bytes[0 .. 4].copy_from_slice(&self.root_page_id.to_le_bytes());
+    }
+
+    fn insert(&mut self, key: Key, page_id: PageId, slot_num: u32) {
+        
+        if self.root_page_id == INVALID_PAGE_ID {
+            let root_page_id = self.buffer_pool.new_page();
+            self.root_page_id = root_page_id;
+            let mut header_guard = self.buffer_pool.check_write_page(self.header_page_id).unwrap();
+            let mut data = header_guard.data_mut().unwrap();
+            self.set_root_page_id(&mut data[..]);
+
+            // if the root page id is equal to an invalid page id this mean that we do not have 
+            // a root node yet so yes we are creating a root page first then we go create an in memory leaf 
+            let leaf = LeafNode {
+                // root leaf in the first ever insert will not have a next page id
+                next_page_id: INVALID_PAGE_ID,
+
+                entries: vec![
+                    (key, RecordId { page_id, slot_num })
+                ]
+            };
+
+            // get the root page with a write guard
+            let mut root_page_guard = self.buffer_pool.check_write_page(self.root_page_id).unwrap();
+            let mut root_page_data = root_page_guard.data_mut().unwrap();
+
+            leaf.encode(&mut root_page_data[..]);
+
+        }
     }
 }
 
@@ -183,5 +225,39 @@ mod b_plus_tree_testing {
 
         assert_eq!(internal.entries.len(), decoded_internal.entries.len());
         assert_eq!(internal.entries, decoded_internal.entries);
+    }
+
+    #[test]
+    fn btree_first_insert() {
+        let mut btree = BTree::new();
+
+        const KEY: i64 = 42;
+        const PAGE_ID: u32 = 3;
+        btree.insert(KEY, PAGE_ID, DEFAULT_SLOT_NUMBER);
+
+        let header_guard = btree.buffer_pool.check_write_page(btree.header_page_id).unwrap();
+        let header_data = header_guard.data().unwrap();
+        let root_from_header = u32::from_le_bytes(header_data[0 .. 4].try_into().unwrap());
+
+        assert_ne!(root_from_header, INVALID_PAGE_ID);
+
+
+        let root_page_guard = btree.buffer_pool.check_read_page(root_from_header).unwrap();
+        let root_data = root_page_guard.data().unwrap();
+        let node_type = root_data[0];
+
+        assert_eq!(node_type, 1);
+
+        let expected_leaf = LeafNode {
+            next_page_id: INVALID_PAGE_ID,
+            entries: vec![
+                (KEY, RecordId { page_id: PAGE_ID, slot_num: DEFAULT_SLOT_NUMBER})
+            ]
+        };
+
+        let leaf = LeafNode::decode(&root_data[..]);
+
+        assert_eq!(expected_leaf.next_page_id, leaf.next_page_id);
+        assert_eq!(expected_leaf.entries, leaf.entries);
     }
 }
