@@ -177,6 +177,13 @@ impl BTree {
 
             leaf.encode(&mut root_page_data[..]);
 
+        } else {
+            let mut root_page_guard = self.buffer_pool.check_write_page(self.root_page_id).unwrap();
+            let mut root_page_data =  root_page_guard.data_mut().unwrap();
+            let mut leaf = LeafNode::decode(&root_page_data);
+
+            leaf.entries.push((key, RecordId { page_id, slot_num }));
+            leaf.encode(&mut root_page_data[..]);
         }
     }
 }
@@ -259,5 +266,45 @@ mod b_plus_tree_testing {
 
         assert_eq!(expected_leaf.next_page_id, leaf.next_page_id);
         assert_eq!(expected_leaf.entries, leaf.entries);
+    }
+
+    #[test] 
+    fn btree_first_insert_multiple_keys() {
+        let mut btree = BTree::new();
+
+        const KEY: i64 = 42;
+        const PAGE_ID: u32 = 2;
+        btree.insert(KEY, PAGE_ID, DEFAULT_SLOT_NUMBER);
+
+        const SECOND_KEY:i64 = 43;
+        const SECOND_PAGE_ID:u32 = 3;
+        btree.insert(SECOND_KEY, SECOND_PAGE_ID, DEFAULT_SLOT_NUMBER);
+
+        const THIRD_KEY:i64 = 44;
+        const THIRD_PAGE_ID:u32 = 4;
+        btree.insert(THIRD_KEY, THIRD_PAGE_ID, DEFAULT_SLOT_NUMBER);
+
+        let header_guard = btree.buffer_pool.check_read_page(btree.header_page_id).unwrap();
+        let header_data = header_guard.data().unwrap();
+        let root_from_header = u32::from_le_bytes(header_data[0 .. 4].try_into().unwrap());
+
+
+        let root_page_guard = btree.buffer_pool.check_read_page(root_from_header).unwrap();
+        let root_data = root_page_guard.data().unwrap();
+        let node_type = root_data[0];
+
+        let expected_leaf = LeafNode {
+            next_page_id: INVALID_PAGE_ID,
+            entries: vec![
+                (KEY, RecordId { page_id: PAGE_ID, slot_num: DEFAULT_SLOT_NUMBER }),
+                (SECOND_KEY, RecordId { page_id: SECOND_PAGE_ID, slot_num: DEFAULT_SLOT_NUMBER }),
+                (THIRD_KEY, RecordId { page_id: THIRD_PAGE_ID, slot_num: DEFAULT_SLOT_NUMBER })
+            ]
+        };
+
+        let leaf = LeafNode::decode(&root_data[..]);
+
+        assert_eq!(expected_leaf.next_page_id, leaf.next_page_id);
+        assert_eq!(expected_leaf.entries, leaf.entries)
     }
 }
