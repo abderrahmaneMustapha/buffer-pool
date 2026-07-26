@@ -24,6 +24,11 @@ enum TreeNode {
     Internal(InternalNode)
 }
 
+struct LocatedNode {
+    page_id: PageId,
+    node: TreeNode,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RecordId {
     pub page_id: PageId,
@@ -188,7 +193,7 @@ impl BTree {
         bytes[0 .. 4].copy_from_slice(&self.root_page_id.to_le_bytes());
     }
 
-    fn get_child(&mut self, child: InternalNode, key: Key) -> TreeNode {
+    fn get_child(&mut self, child: InternalNode, key: Key) -> LocatedNode {
         let child_index = child.find_child_index(key);
         let child_page_id = child.entries[child_index].1;
 
@@ -197,8 +202,8 @@ impl BTree {
         let node_type = page_data[0];
 
         match page_data[0] {
-            LEAF_NODE => TreeNode::Leaf(LeafNode::decode(&page_data[..])),
-            INTERNAL_NODE => TreeNode::Internal(InternalNode::decode(&page_data[..])),
+            LEAF_NODE => LocatedNode { page_id: child_page_id, node: TreeNode::Leaf(LeafNode::decode(&page_data[..])) },
+            INTERNAL_NODE => LocatedNode { page_id: child_page_id, node: TreeNode::Internal(InternalNode::decode(&page_data[..])) },
             _ => panic!("unknown node type")
         }
     }
@@ -232,13 +237,18 @@ impl BTree {
 
             leaf.encode(&mut root_page_data[..]);
 
-        } else {
+        } 
+
+        // other insertions
+        else {
             let mut leaf = LeafNode {
                 next_page_id: INVALID_PAGE_ID,
                 entries: vec![],
             };
-            let mut right_leaf_page_id = self.root_page_id;
 
+            // this is used to track the latest leaf page id we inserted into
+            // thats what we use for all cases
+            let mut leaf_page_id = self.root_page_id;
             {
                 let mut root_page_guard = self.buffer_pool.check_write_page(self.root_page_id).unwrap();
                 let mut root_page_data = root_page_guard.data_mut().unwrap();
@@ -262,31 +272,34 @@ impl BTree {
                     let mut internal  = InternalNode::decode(&root_page_data[..]);
                     loop {
                         match self.get_child(internal, key) {
-                            TreeNode::Leaf(mut leafNode) => {
+                            LocatedNode {page_id: child_page_id, node: TreeNode::Leaf(mut leafNode)} => {
                                 leaf = leafNode;
                                 leaf.entries.push((key, RecordId { page_id, slot_num }));
                                 leaf.entries.sort_unstable_by_key(|item| item.0);
+                                leaf_page_id = child_page_id;
                                 break;
                             }
                             
-                            TreeNode::Internal(next_internal) => {
+                            LocatedNode { node: TreeNode::Internal(next_internal), .. } => {
                                 internal = next_internal
                             }
                         }
                     }
                 }
             }
-        
-            // first split
+
+            // split
             if leaf.entries.len() > self.leaf_node_max_size.try_into().unwrap() {
-                // first split
                 let middle_index = leaf.entries.len() / 2;
                 let middle_entry = leaf.entries[middle_index];
 
+                let right_leaf_page_id = leaf_page_id;
                 let left_leaf_page_id = self.buffer_pool.new_page();
+
                 {
                     let mut left_leaf_guard = self.buffer_pool.check_write_page(left_leaf_page_id).unwrap();
                     let mut left_leaf_data = left_leaf_guard.data_mut().unwrap();
+
                     let right_leaf_entries = leaf.entries.split_off(middle_index);
                     let left_leaf_entries = leaf.entries;
                     
@@ -327,6 +340,10 @@ impl BTree {
                     self.set_root_page_id(&mut header_data[..]);
                 }
 
+            } else {
+                let mut leaf_guard = self.buffer_pool.check_write_page(leaf_page_id).unwrap();
+                let mut leaf_data = leaf_guard.data_mut().unwrap();
+                leaf.encode(&mut leaf_data[..]);
             }
         }
     }
@@ -496,6 +513,36 @@ mod b_plus_tree_testing {
 
     }
 
+    #[test]
+    fn btree_insert_after_split_persists_to_leaf() {
+        let mut btree = BTree::new();
+        btree.set_leaf_max_size(4);
+
+        for (k, pid) in [(41, 1), (42, 2), (43, 3), (44, 4), (45, 5)] {
+            btree.insert(k, pid, DEFAULT_SLOT_NUMBER);
+        }
+
+        btree.insert(46, 6, DEFAULT_SLOT_NUMBER);
+
+        let header_guard = btree.buffer_pool.check_read_page(btree.header_page_id).unwrap();
+        let header_data = header_guard.data().unwrap();
+        let root_from_header = u32::from_le_bytes(header_data[0 .. 4].try_into().unwrap());
+
+        let root_page_guard = btree.buffer_pool.check_read_page(root_from_header).unwrap();
+        let root_data = root_page_guard.data().unwrap();
+        
+        let root_node = InternalNode::decode(&root_data[..]);
+
+        let leaf_node = match btree.get_child(root_node, 46) {
+            LocatedNode {page_id: child_page_id, node: TreeNode::Leaf(leaf)} => {
+                assert!(leaf.entries.contains(&(46, RecordId { page_id: 6, slot_num: DEFAULT_SLOT_NUMBER })));
+            } 
+            LocatedNode { node: TreeNode::Internal(internal), .. } => {
+                panic!("test failed unhadled case");
+            }
+        };        
+    }
+    
     #[test]
     fn btree_advanced_splits() {
 
