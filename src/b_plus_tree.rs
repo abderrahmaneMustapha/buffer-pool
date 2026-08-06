@@ -300,7 +300,7 @@ impl BTree {
 
             // split
             if leaf.entries.len() > self.leaf_node_max_size.try_into().unwrap() {
-                let middle_index = leaf.entries.len() / 2;
+                let middle_index = (leaf.entries.len() + 2 - 1) / 2;
                 let middle_entry = leaf.entries[middle_index];
 
                 let right_leaf_page_id = leaf_page_id;
@@ -370,7 +370,45 @@ impl BTree {
                         parent_internal.entries[parent_internal_key_index].1 = left_leaf_page_id;
                         parent_internal.entries.push((internal_key, right_leaf_page_id));
                         parent_internal.entries.sort_unstable_by_key(|item| item.0);
-    
+
+                        if parent_internal.entries.len() > self.internal_node_max_size.try_into().unwrap() {
+                            let internal_middle_index = (parent_internal.entries.len() + 2 - 1) / 2;
+                            let internal_middle_entry = parent_internal.entries[internal_middle_index];
+                            let right_internal_id = self.buffer_pool.new_page();
+                            let left_internal = parent_internal_page_id;
+
+                            let new_parent_internal_id = self.buffer_pool.new_page();
+
+                            let mut right_internal_entries = parent_internal.entries.split_off(internal_middle_index + 1);
+
+                            {
+                                let mut right_internal_guard = self.buffer_pool.check_write_page(right_internal_id).unwrap();
+                                let mut right_internal_data = right_internal_guard.data_mut().unwrap();
+                                let mut right_internal_node = InternalNode::decode(&right_internal_data[..]);
+
+                                right_internal_entries.insert(0, (INVALID_KEY, internal_middle_entry.1));
+                                right_internal_node.entries = right_internal_entries;
+
+                                right_internal_node.encode(&mut right_internal_data[..]);
+                            }
+
+                            let mut new_parent_internal_guard = self.buffer_pool.check_write_page(new_parent_internal_id).unwrap();
+                            let mut new_parent_internal_data = new_parent_internal_guard.data_mut().unwrap();
+                            let mut new_parent_internal_node = InternalNode::decode(&new_parent_internal_data[..]);
+
+                            new_parent_internal_node.entries.push((INVALID_KEY, new_parent_internal_id));
+                            new_parent_internal_node.entries.push((internal_middle_entry.0, right_internal_id));
+
+                            new_parent_internal_node.encode(&mut new_parent_internal_data);
+
+                            let mut header_guard = self.buffer_pool.check_write_page(self.header_page_id).unwrap();
+                            let mut header_data = header_guard.data_mut().unwrap();
+
+                            self.root_page_id = new_parent_internal_id;
+                            self.set_root_page_id(&mut header_data[..]);
+
+                        }
+
                         prev_leaf.next_page_id = left_leaf_page_id;
                         prev_leaf.encode(&mut prev_leaf_data);
     
@@ -379,6 +417,45 @@ impl BTree {
                         parent_internal.entries[parent_internal_key_index].1 = left_leaf_page_id;
                         parent_internal.entries.push((internal_key, right_leaf_page_id));
                         parent_internal.entries.sort_unstable_by_key(|item| item.0);
+
+                        if parent_internal.entries.len() > self.internal_node_max_size.try_into().unwrap() {
+                            let internal_middle_index = (parent_internal.entries.len() + 2 - 1) / 2;
+                            let internal_middle_entry = parent_internal.entries[internal_middle_index];
+
+                            let right_internal_id = self.buffer_pool.new_page();
+                            let left_internal = parent_internal_page_id;
+
+                            let new_parent_internal_id = self.buffer_pool.new_page();
+
+                            let mut right_internal_entries = parent_internal.entries.split_off(internal_middle_index + 1);
+
+                            {
+                                let mut right_internal_guard = self.buffer_pool.check_write_page(right_internal_id).unwrap();
+                                let mut right_internal_data = right_internal_guard.data_mut().unwrap();
+                                let mut right_internal_node = InternalNode::decode(&right_internal_data[..]);
+
+                                right_internal_entries.insert(0, (INVALID_KEY, internal_middle_entry.1));
+                                right_internal_node.entries = right_internal_entries;
+
+                                right_internal_node.encode(&mut right_internal_data[..]);
+                            }
+
+                            let mut new_parent_internal_guard = self.buffer_pool.check_write_page(new_parent_internal_id).unwrap();
+                            let mut new_parent_internal_data = new_parent_internal_guard.data_mut().unwrap();
+                            let mut new_parent_internal_node = InternalNode::decode(&new_parent_internal_data[..]);
+
+                            new_parent_internal_node.entries.push((INVALID_KEY, parent_internal_page_id));
+                            new_parent_internal_node.entries.push((internal_middle_entry.0, right_internal_id));
+
+                            new_parent_internal_node.encode(&mut new_parent_internal_data);
+
+                            let mut header_guard = self.buffer_pool.check_write_page(self.header_page_id).unwrap();
+                            let mut header_data = header_guard.data_mut().unwrap();
+
+                            self.root_page_id = new_parent_internal_id;
+                            self.set_root_page_id(&mut header_data[..]);
+
+                        }
                         parent_internal.encode(&mut parent_data[..]);
                     }
                 }
@@ -592,20 +669,22 @@ mod b_plus_tree_testing {
         btree.set_leaf_max_size(3);
         btree.set_internal_max_size(4);
 
-        for (k, pid) in [(41, 1), (42, 2), (43, 3), (44, 4), (45, 5), (46, 6), (47, 7)] {
-            btree.insert(k, pid, DEFAULT_SLOT_NUMBER);
-        }
-        /*
-              43,     45
-              
-        41,42   43,44,  45,46,47
-        */
 
-        let header_guard = btree.buffer_pool.check_read_page(btree.header_page_id).unwrap();
-        let header_data = header_guard.data().unwrap();
-            
-        let root_from_header = u32::from_le_bytes(header_data[0 .. 4].try_into().unwrap());
         {
+            for (k, pid) in [(41, 1), (42, 2), (43, 3), (44, 4), (45, 5), (46, 6), (47, 7)] {
+                btree.insert(k, pid, DEFAULT_SLOT_NUMBER);
+            }
+            /*
+                    43,     45
+                    
+                41,42   43,44,  45,46,47
+            */
+
+            let header_guard = btree.buffer_pool.check_read_page(btree.header_page_id).unwrap();
+            let header_data = header_guard.data().unwrap();
+                
+            let root_from_header = u32::from_le_bytes(header_data[0 .. 4].try_into().unwrap());
+
             let root_page_guard = btree.buffer_pool.check_read_page(root_from_header).unwrap();
             let root_data = root_page_guard.data().unwrap();
 
@@ -659,23 +738,74 @@ mod b_plus_tree_testing {
             assert_eq!(third_leaf_next_page_id, INVALID_PAGE_ID);
             assert_eq!(third_leaf_current_size, 3);
         }
-        /*
-              43,     45
-              
-        40,41,42   43,44,  45,46,47
-        */
-        btree.insert(40, 10, DEFAULT_SLOT_NUMBER);
 
-        let first_leaf_guard = btree.buffer_pool.check_read_page(2).unwrap();
-        let first_leaf_data = first_leaf_guard.data().unwrap();
-        let first_leaf_first_key = i64::from_le_bytes(first_leaf_data[HEADER_SIZE .. HEADER_SIZE + 8].try_into().unwrap());
-        
-        assert_eq!(first_leaf_first_key, 40);
-        /*
-              43,     45.    47
+        {
+            /*
+                43,     45
+                
+            40,41,42   43,44,  45,46,47
+            */
+            btree.insert(40, 10, DEFAULT_SLOT_NUMBER);
 
-        41,42  43,44,  45,46, 47,48
-        */
+            let first_leaf_guard = btree.buffer_pool.check_read_page(2).unwrap();
+            let first_leaf_data = first_leaf_guard.data().unwrap();
+            let first_leaf_first_key = i64::from_le_bytes(first_leaf_data[HEADER_SIZE .. HEADER_SIZE + 8].try_into().unwrap());
+
+            assert_eq!(first_leaf_first_key, 40);
+        }
+
+        {
+            /*
+                  41,       43,     45, 47
+                
+            39,40    41,42   43,44,  45,46,  47, 48
+            */
+
+            btree.insert(39, 1009, DEFAULT_SLOT_NUMBER);
+
+            let header_guard = btree.buffer_pool.check_read_page(btree.header_page_id).unwrap();
+            let header_data = header_guard.data().unwrap();
+                
+            let root_from_header = u32::from_le_bytes(header_data[0 .. 4].try_into().unwrap());
+
+            let root_page_guard = btree.buffer_pool.check_read_page(root_from_header).unwrap();
+            let root_data = root_page_guard.data().unwrap();
+
+            let root_node = InternalNode::decode(&root_data[..]);
+
+            assert_eq!(root_from_header, 3);
+            assert_eq!(root_node.entries.len(), 4);
+            assert_eq!(root_node.entries[0].0, INVALID_KEY);
+            assert_eq!(root_node.entries[1].0, 41);
+            assert_eq!(root_node.entries[2].0, 43);
+            assert_eq!(root_node.entries[3].0, 45);
+        }
+        { 
+            /*
+
+                                         45
+                      41,      43                    47
+                    
+                39,40    41,42    43,44,        45,46,   47,48
+            */
+            btree.insert(48, 8, DEFAULT_SLOT_NUMBER);
+
+            let header_guard = btree.buffer_pool.check_read_page(btree.header_page_id).unwrap();
+            let header_data = header_guard.data().unwrap();
+                
+            let root_from_header = u32::from_le_bytes(header_data[0 .. 4].try_into().unwrap());
+
+            let root_page_guard = btree.buffer_pool.check_read_page(root_from_header).unwrap();
+            let root_data = root_page_guard.data().unwrap();
+
+            let root_node = InternalNode::decode(&root_data[..]);
+            assert_ne!(root_from_header, 3);
+            assert_eq!(root_from_header, 8);
+
+            assert_eq!(root_node.entries.len(), 2);
+            assert_eq!(root_node.entries[0].0, INVALID_KEY);
+            assert_eq!(root_node.entries[1].0, 45);
+        }
 
 
     }
