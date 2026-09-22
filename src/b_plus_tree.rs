@@ -6,6 +6,7 @@
 use crate::buffer_pool::BufferPoolManager;
 use crate::disk_manager::DiskManager;
 use crate::common::{PageId, INVALID_PAGE_ID};
+use crate::guard::WritePageGuard;
 use std::sync::{Arc, Mutex};
 
 const DEFAULT_LEAF_NODE_MAX_SIZE: u32 = 511;
@@ -24,11 +25,16 @@ enum TreeNode {
     Internal(InternalNode)
 }
 
-struct LocatedNode {
+struct DEPRECATED_LocatedNode {
     parent_key_index: usize,
     parent_page_id: PageId,
     page_id: PageId,
     node: TreeNode,
+}
+
+struct PathFrame {
+    slot_to_next_child: usize,
+    guard: WritePageGuard,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -195,7 +201,7 @@ impl BTree {
         bytes[0 .. 4].copy_from_slice(&self.root_page_id.to_le_bytes());
     }
 
-    fn get_child(&mut self, child: &InternalNode, key: Key) -> LocatedNode {
+    fn DEPRECATED_get_child(&mut self, child: &InternalNode, key: Key) -> DEPRECATED_LocatedNode {
         let child_index = child.find_child_index(key);
         let child_page_id = child.entries[child_index].1;
 
@@ -204,8 +210,8 @@ impl BTree {
         let node_type = page_data[0];
 
         match page_data[0] {
-            LEAF_NODE => LocatedNode { parent_page_id: child_page_id, parent_key_index: child_index, page_id: child_page_id, node: TreeNode::Leaf(LeafNode::decode(&page_data[..])) },
-            INTERNAL_NODE => LocatedNode { parent_page_id: child_page_id, parent_key_index: child_index, page_id: child_page_id, node: TreeNode::Internal(InternalNode::decode(&page_data[..])) },
+            LEAF_NODE => DEPRECATED_LocatedNode { parent_page_id: child_page_id, parent_key_index: child_index, page_id: child_page_id, node: TreeNode::Leaf(LeafNode::decode(&page_data[..])) },
+            INTERNAL_NODE => DEPRECATED_LocatedNode { parent_page_id: child_page_id, parent_key_index: child_index, page_id: child_page_id, node: TreeNode::Internal(InternalNode::decode(&page_data[..])) },
             _ => panic!("unknown node type")
         }
     }
@@ -238,232 +244,213 @@ impl BTree {
             let mut root_page_data = root_page_guard.data_mut().unwrap();
 
             leaf.encode(&mut root_page_data[..]);
-
         } 
 
         // other insertions
         else {
-            let mut leaf = LeafNode {
-                next_page_id: INVALID_PAGE_ID,
-                entries: vec![],
-            };
-
-            // this is used to track the latest leaf page id we inserted into
-            // thats what we use for all cases
-            let mut leaf_page_id = self.root_page_id;
-            let mut parent_internal: InternalNode = InternalNode {
-                entries: vec![]
-            };
-            let mut parent_internal_key_index: usize = usize::MAX;
-            let mut parent_internal_page_id: PageId = INVALID_PAGE_ID;
+            // this is where we go advanced splits we get a stack and we save the write guards
+            // thats naiv approach and to be improved later with latch crabbing after making
+            // the solution work
+            let mut path_stack: Vec<PathFrame> = vec![];
 
             {
                 let mut root_page_guard = self.buffer_pool.check_write_page(self.root_page_id).unwrap();
-                let mut root_page_data = root_page_guard.data_mut().unwrap();
-                let node_type = root_page_data[0];
+  
+                let node_type = {
+                    let mut root_page_data = root_page_guard.data_mut().unwrap();
+
+                    root_page_data[0]
+                };
 
                 if node_type == LEAF_NODE {
-                    leaf = LeafNode::decode(&root_page_data[..]);
-
-                    // add element when the root is a leaf
-                    if leaf.entries.len() <= self.leaf_node_max_size.try_into().unwrap() {
-                        leaf.entries.push((key, RecordId { page_id, slot_num }));
-                        leaf.entries.sort_unstable_by_key(|item| item.0);
-                        leaf.encode(&mut root_page_data[..]);
-                    } 
-                } 
+                    path_stack.push(PathFrame {
+                        slot_to_next_child: usize::MAX,
+                        guard:root_page_guard,
+                    })
+                }
                 
                 // navigating the tree
-                if node_type == INTERNAL_NODE {
-                    let mut internal  = InternalNode::decode(&root_page_data[..]);
-                    parent_internal_page_id = self.root_page_id;
+                else if node_type == INTERNAL_NODE {
+                    let mut internal  = {
+                        let root_page_data = root_page_guard.data().unwrap();
+                        InternalNode::decode(&root_page_data[..])
+                    };
+
+
+                    let mut slot_to_next_child = internal.find_child_index(key);
+                    path_stack.push(PathFrame {
+                        slot_to_next_child,
+                        guard: root_page_guard,
+                    });
                     loop {
-                        match self.get_child(&internal, key) {
-                            LocatedNode { parent_key_index , page_id: child_page_id, node: TreeNode::Leaf(mut leafNode), .. } => {
-                                leaf = leafNode;
-                                leaf.entries.push((key, RecordId { page_id, slot_num }));
-                                leaf.entries.sort_unstable_by_key(|item| item.0);
-                                leaf_page_id = child_page_id;
-                                parent_internal = internal;
-                                parent_internal_key_index = parent_key_index;
-                                break;
+                        let mut child_page_id = INVALID_PAGE_ID;
+                        let mut node_type: u8 = u8::MAX;
+                        {   
+                            child_page_id =  internal.entries[slot_to_next_child].1;
+
+                            let child_read_guard = self.buffer_pool.check_read_page(child_page_id).unwrap();
+                            let child_read_data = child_read_guard.data().unwrap();
+
+                            node_type = child_read_data[0];
+
+                            if node_type == INTERNAL_NODE {
+                                let child_internal_node = InternalNode::decode(&child_read_data[..]);
+                                slot_to_next_child = child_internal_node.find_child_index(key);
+                                internal = child_internal_node;
                             }
-                            
-                            LocatedNode { parent_page_id, node: TreeNode::Internal(next_internal), .. } => {
-                                internal = next_internal;
-                                parent_internal_page_id = parent_page_id;
-                            }
+                        } 
+
+                        if node_type == LEAF_NODE {
+
+                            slot_to_next_child = INVALID_PAGE_ID as usize;
+
+                            let guard = self.buffer_pool.check_write_page(child_page_id).unwrap();
+                    
+                            path_stack.push(PathFrame {
+                                guard,
+                                slot_to_next_child,
+                            });
+                            break;
                         }
+
+                        let guard = self.buffer_pool.check_write_page(child_page_id).unwrap();
+                        path_stack.push(PathFrame {
+                            guard,
+                            slot_to_next_child,
+                        });
                     }
                 }
             }
 
-            // split
-            if leaf.entries.len() > self.leaf_node_max_size.try_into().unwrap() {
-                let middle_index = (leaf.entries.len() + 2 - 1) / 2;
-                let middle_entry = leaf.entries[middle_index];
+            let split:u32 = {
+                let entrie = path_stack.pop();
+                let mut leaf_guard = entrie.unwrap().guard;
+                let leaf_page_id = leaf_guard.page_id();
+                let mut leaf_data = leaf_guard.data_mut().unwrap();
+                let mut leaf_node = LeafNode::decode(&leaf_data[..]);
+                leaf_node.entries.push((key, RecordId { page_id, slot_num }));
+                leaf_node.entries.sort_unstable_by_key(|item| item.0);
+                leaf_node.encode(&mut leaf_data[..]);
 
-                let right_leaf_page_id = leaf_page_id;
-                let left_leaf_page_id = self.buffer_pool.new_page();
+                if leaf_node.entries.len() > self.leaf_node_max_size.try_into().unwrap() {
+                    println!("we are splitting things here len {}, max len {}, leaf page id {}", leaf_node.entries.len(), self.leaf_node_max_size, leaf_page_id);
+                    leaf_page_id
+                } else {
+                    INVALID_PAGE_ID
+                }
+            };
 
+            if split != INVALID_PAGE_ID {
+
+                let right_leaf_page_id = self.buffer_pool.new_page();
+
+                let left_leaf_page_id = split;
+                let mut middle_entry;
+
+                // we splitted things here
                 {
                     let mut left_leaf_guard = self.buffer_pool.check_write_page(left_leaf_page_id).unwrap();
                     let mut left_leaf_data = left_leaf_guard.data_mut().unwrap();
+                    let mut left_leaf = LeafNode::decode(&left_leaf_data[..]);
 
-                    let right_leaf_entries = leaf.entries.split_off(middle_index);
-                    let left_leaf_entries = leaf.entries;
-                    
-                    let left_leaf = LeafNode {
-                        next_page_id: right_leaf_page_id,
-                        entries: left_leaf_entries,
+                    let middle_index = left_leaf.entries.len() / 2;
+                    middle_entry = left_leaf.entries[middle_index];
+
+                    let mut right_leaf_guard = self.buffer_pool.check_write_page(right_leaf_page_id).unwrap();
+                    let mut right_leaf_data = right_leaf_guard.data_mut().unwrap();
+
+                    let right_leaf_entries = left_leaf.entries.split_off(middle_index);
+                    let left_leaf_entries = left_leaf.entries;
+
+                    let right_leaf = LeafNode {
+                        next_page_id: left_leaf.next_page_id,
+                        entries: right_leaf_entries,
                     };
-                    leaf.entries = right_leaf_entries;
+                    right_leaf.encode(&mut right_leaf_data[..]);
+  
+                    left_leaf.entries = left_leaf_entries;
 
+                    left_leaf.next_page_id = right_leaf_page_id;
                     left_leaf.encode(&mut left_leaf_data[..]);
                 } 
 
-                {
-                    let mut right_leaf_guard = self.buffer_pool.check_write_page(right_leaf_page_id).unwrap();
-                    let mut right_leaf_data = right_leaf_guard.data_mut().unwrap();
-                    leaf.encode(&mut right_leaf_data[..]);
-                }
+                let mut intended_insert = (INVALID_KEY, INVALID_PAGE_ID);
+                let (sep_key, ..) = middle_entry;
+                let mut intended_insert = (sep_key, right_leaf_page_id);
+                let mut left_page_id = left_leaf_page_id;
+                println!("stack len {}", path_stack.len());
+                loop {
+                    match path_stack.pop() {
+                        Some(frame) => {
+                            let mut internal_page_id = {
+                                frame.guard.page_id()
+                            };
 
+                            let mut internal_guard = frame.guard;
+                            let mut internal_data = internal_guard.data_mut().unwrap();
+                            let mut internal_node = InternalNode::decode(&internal_data[..]);
 
-                // to make this fit the case of advanced splits we need to update this
-                // as we are not always creating a new internal node, sometimes we get that
-                // internal node as a parent of the leaf we wanted to split aand we add the 
-                // promoted key to it
-                // but the issue now is that we got the leaf to get its parent we neeed to travel back the tree from root
-                // to that leaf to get the parent node so we can update the traverse tree code and when we get the leaf
-                // we get its aprent with it and pass it here 
-                let (internal_key , _) = middle_entry;
-                if right_leaf_page_id == self.root_page_id {
-                    
-                    let internal = InternalNode {
-                        entries: vec![
-                            (INVALID_KEY, left_leaf_page_id), 
-                            (internal_key, right_leaf_page_id)
-                        ]
-                    };
+                            let (key, right_page_id) = intended_insert;
+                      
+                            let ptr_to_left_index = internal_node.entries.iter().position(|(.. , _pid)| *_pid == left_page_id).unwrap();
+                            internal_node.entries.insert(ptr_to_left_index + 1, (key, right_page_id));
 
-                    let internal_page_id = self.buffer_pool.new_page();
-                    let mut internal_guard = self.buffer_pool.check_write_page(internal_page_id).unwrap();
-                    let mut internal_data = internal_guard.data_mut().unwrap();
-
-                    internal.encode(&mut internal_data[..]);
-
-                    let mut header_guard = self.buffer_pool.check_write_page(self.header_page_id).unwrap();
-                    let mut header_data = header_guard.data_mut().unwrap();
-        
-                    self.root_page_id = internal_page_id;
-                    self.set_root_page_id(&mut header_data[..]);
-                } else {
-                    let mut parent_guard = self.buffer_pool.check_write_page(parent_internal_page_id).unwrap();
-                    let mut parent_data = parent_guard.data_mut().unwrap();
-
-                    if parent_internal_key_index > 0 {
-                        let prev_key_index = parent_internal_key_index - 1;
-                        let mut prev_leaf_guard = self.buffer_pool.check_write_page(parent_internal.entries[prev_key_index].1).unwrap();
-                        let mut prev_leaf_data = prev_leaf_guard.data_mut().unwrap();
-                        let mut prev_leaf = LeafNode::decode(&prev_leaf_data[ .. ]);
-    
-                        parent_internal.entries[parent_internal_key_index].1 = left_leaf_page_id;
-                        parent_internal.entries.push((internal_key, right_leaf_page_id));
-                        parent_internal.entries.sort_unstable_by_key(|item| item.0);
-
-                        if parent_internal.entries.len() > self.internal_node_max_size.try_into().unwrap() {
-                            let internal_middle_index = (parent_internal.entries.len() + 2 - 1) / 2;
-                            let internal_middle_entry = parent_internal.entries[internal_middle_index];
-                            let right_internal_id = self.buffer_pool.new_page();
-                            let left_internal = parent_internal_page_id;
-
-                            let new_parent_internal_id = self.buffer_pool.new_page();
-
-                            let mut right_internal_entries = parent_internal.entries.split_off(internal_middle_index + 1);
-
-                            {
-                                let mut right_internal_guard = self.buffer_pool.check_write_page(right_internal_id).unwrap();
-                                let mut right_internal_data = right_internal_guard.data_mut().unwrap();
-                                let mut right_internal_node = InternalNode::decode(&right_internal_data[..]);
-
-                                right_internal_entries.insert(0, (INVALID_KEY, internal_middle_entry.1));
-                                right_internal_node.entries = right_internal_entries;
-
-                                right_internal_node.encode(&mut right_internal_data[..]);
+                            if internal_node.entries.len() <= self.internal_node_max_size as usize {
+                                internal_node.encode(&mut internal_data[..]);
+                                break;
                             }
 
-                            let mut new_parent_internal_guard = self.buffer_pool.check_write_page(new_parent_internal_id).unwrap();
-                            let mut new_parent_internal_data = new_parent_internal_guard.data_mut().unwrap();
-                            let mut new_parent_internal_node = InternalNode::decode(&new_parent_internal_data[..]);
-
-                            new_parent_internal_node.entries.push((INVALID_KEY, new_parent_internal_id));
-                            new_parent_internal_node.entries.push((internal_middle_entry.0, right_internal_id));
-
-                            new_parent_internal_node.encode(&mut new_parent_internal_data);
-
-                            let mut header_guard = self.buffer_pool.check_write_page(self.header_page_id).unwrap();
-                            let mut header_data = header_guard.data_mut().unwrap();
-
-                            self.root_page_id = new_parent_internal_id;
-                            self.set_root_page_id(&mut header_data[..]);
-
-                        }
-
-                        prev_leaf.next_page_id = left_leaf_page_id;
-                        prev_leaf.encode(&mut prev_leaf_data);
-    
-                        parent_internal.encode(&mut parent_data[..]); 
-                    } else {
-                        parent_internal.entries[parent_internal_key_index].1 = left_leaf_page_id;
-                        parent_internal.entries.push((internal_key, right_leaf_page_id));
-                        parent_internal.entries.sort_unstable_by_key(|item| item.0);
-
-                        if parent_internal.entries.len() > self.internal_node_max_size.try_into().unwrap() {
-                            let internal_middle_index = (parent_internal.entries.len() + 2 - 1) / 2;
-                            let internal_middle_entry = parent_internal.entries[internal_middle_index];
+                            let mid = internal_node.entries.len() / 2;
+                            let (up_key, up_pid) = internal_node.entries[mid];
 
                             let right_internal_id = self.buffer_pool.new_page();
-                            let left_internal = parent_internal_page_id;
 
-                            let new_parent_internal_id = self.buffer_pool.new_page();
-
-                            let mut right_internal_entries = parent_internal.entries.split_off(internal_middle_index + 1);
-
+                            let mut right_entries = internal_node.entries.split_off(mid);
+                            right_entries[0].0 = INVALID_KEY;
+                            
                             {
-                                let mut right_internal_guard = self.buffer_pool.check_write_page(right_internal_id).unwrap();
-                                let mut right_internal_data = right_internal_guard.data_mut().unwrap();
-                                let mut right_internal_node = InternalNode::decode(&right_internal_data[..]);
+                                let mut right_guard = self.buffer_pool.check_write_page(right_internal_id).unwrap();
+                                let mut right_data = right_guard.data_mut().unwrap();
+                                let right_internal_node = InternalNode {
+                                    entries: right_entries
+                                };
 
-                                right_internal_entries.insert(0, (INVALID_KEY, internal_middle_entry.1));
-                                right_internal_node.entries = right_internal_entries;
-
-                                right_internal_node.encode(&mut right_internal_data[..]);
+                                right_internal_node.encode(&mut right_data[..]);
                             }
 
-                            let mut new_parent_internal_guard = self.buffer_pool.check_write_page(new_parent_internal_id).unwrap();
-                            let mut new_parent_internal_data = new_parent_internal_guard.data_mut().unwrap();
-                            let mut new_parent_internal_node = InternalNode::decode(&new_parent_internal_data[..]);
+                            internal_node.encode(&mut internal_data);
 
-                            new_parent_internal_node.entries.push((INVALID_KEY, parent_internal_page_id));
-                            new_parent_internal_node.entries.push((internal_middle_entry.0, right_internal_id));
+                            intended_insert = (up_key, right_internal_id);
+                            left_page_id = internal_page_id;
+                        }
 
-                            new_parent_internal_node.encode(&mut new_parent_internal_data);
+                        None => {
+                            println!("asndioashdas");
+                            let root_page_id = {
+                                let new_root_page_id = self.buffer_pool.new_page();
+                                let mut root_page_guard = self.buffer_pool.check_write_page(new_root_page_id).unwrap();
+                                let mut root_page_data = root_page_guard.data_mut().unwrap();
 
+                                let (key, right_page_id) = intended_insert;
+                                let root_node = InternalNode {
+                                    entries: vec![(INVALID_KEY, left_page_id), (key, right_page_id)]
+                                };
+
+                                {
+                                    root_node.encode(&mut root_page_data[..]);
+                                }
+
+                                new_root_page_id
+                            };
+
+                            self.root_page_id = root_page_id;
                             let mut header_guard = self.buffer_pool.check_write_page(self.header_page_id).unwrap();
                             let mut header_data = header_guard.data_mut().unwrap();
-
-                            self.root_page_id = new_parent_internal_id;
                             self.set_root_page_id(&mut header_data[..]);
-
+                            break;
                         }
-                        parent_internal.encode(&mut parent_data[..]);
                     }
                 }
-
-            } else {
-                let mut leaf_guard = self.buffer_pool.check_write_page(leaf_page_id).unwrap();
-                let mut leaf_data = leaf_guard.data_mut().unwrap();
-                leaf.encode(&mut leaf_data[..]);
             }
         }
     }
@@ -641,6 +628,11 @@ mod b_plus_tree_testing {
         for (k, pid) in [(41, 1), (42, 2), (43, 3), (44, 4), (45, 5)] {
             btree.insert(k, pid, DEFAULT_SLOT_NUMBER);
         }
+        /*
+                43 
+        
+        41, 42,     43, 44, 45
+        */
 
         btree.insert(46, 6, DEFAULT_SLOT_NUMBER);
 
@@ -653,14 +645,21 @@ mod b_plus_tree_testing {
         
         let root_node = InternalNode::decode(&root_data[..]);
 
-        let leaf_node = match btree.get_child(&root_node, 46) {
-            LocatedNode {node: TreeNode::Leaf(leaf), .. } => {
-                assert!(leaf.entries.contains(&(46, RecordId { page_id: 6, slot_num: DEFAULT_SLOT_NUMBER })));
-            } 
-            LocatedNode { .. } => {
-                panic!("test failed unhadled case");
-            }
-        };        
+        {
+            let left_guard = btree.buffer_pool.check_read_page(root_node.entries[0].1).unwrap();
+            let left_data = left_guard.data().unwrap();
+            let left_node = LeafNode::decode(&left_data[..]);
+
+            assert_eq!(root_node.entries[1].1, left_node.next_page_id);
+        }    
+
+        {
+            let right_guard = btree.buffer_pool.check_read_page(root_node.entries[1].1).unwrap();
+            let right_data = right_guard.data().unwrap();
+            let right_node = LeafNode::decode(&right_data[..]);
+
+            assert_eq!(right_node.next_page_id, INVALID_PAGE_ID);
+        }   
     }
     
     #[test]
@@ -668,7 +667,6 @@ mod b_plus_tree_testing {
         let mut btree = BTree::new();
         btree.set_leaf_max_size(3);
         btree.set_internal_max_size(4);
-
 
         {
             for (k, pid) in [(41, 1), (42, 2), (43, 3), (44, 4), (45, 5), (46, 6), (47, 7)] {
@@ -678,11 +676,13 @@ mod b_plus_tree_testing {
                     43,     45
                     
                 41,42   43,44,  45,46,47
-            */
 
+                
+                     {3}  43.          45 
+                {1} 41 42     {2} 43 44    {4} 45 46
+            */
             let header_guard = btree.buffer_pool.check_read_page(btree.header_page_id).unwrap();
             let header_data = header_guard.data().unwrap();
-                
             let root_from_header = u32::from_le_bytes(header_data[0 .. 4].try_into().unwrap());
 
             let root_page_guard = btree.buffer_pool.check_read_page(root_from_header).unwrap();
@@ -695,7 +695,6 @@ mod b_plus_tree_testing {
             assert_eq!(root_node.entries[0].0, INVALID_KEY);
             assert_eq!(root_node.entries[1].0, 43);
             assert_eq!(root_node.entries[2].0, 45);
-
 
             // reading the leaf that has the keys 41, 42
             let first_leaf_guard = btree.buffer_pool.check_read_page(root_node.entries[0].1).unwrap();
@@ -747,7 +746,12 @@ mod b_plus_tree_testing {
             */
             btree.insert(40, 10, DEFAULT_SLOT_NUMBER);
 
-            let first_leaf_guard = btree.buffer_pool.check_read_page(2).unwrap();
+            let root_from_header = btree.root_page_id;
+            let root_page_guard = btree.buffer_pool.check_read_page(root_from_header).unwrap();
+            let root_data = root_page_guard.data().unwrap();
+            let root_node = InternalNode::decode(&root_data[..]);
+
+            let first_leaf_guard = btree.buffer_pool.check_read_page(root_node.entries[0].1).unwrap();
             let first_leaf_data = first_leaf_guard.data().unwrap();
             let first_leaf_first_key = i64::from_le_bytes(first_leaf_data[HEADER_SIZE .. HEADER_SIZE + 8].try_into().unwrap());
 
@@ -781,13 +785,6 @@ mod b_plus_tree_testing {
             assert_eq!(root_node.entries[3].0, 45);
         }
         { 
-            /*
-
-                                         45
-                      41,      43                    47
-                    
-                39,40    41,42    43,44,        45,46,   47,48
-            */
             btree.insert(48, 8, DEFAULT_SLOT_NUMBER);
 
             let header_guard = btree.buffer_pool.check_read_page(btree.header_page_id).unwrap();
@@ -804,10 +801,42 @@ mod b_plus_tree_testing {
 
             assert_eq!(root_node.entries.len(), 2);
             assert_eq!(root_node.entries[0].0, INVALID_KEY);
-            assert_eq!(root_node.entries[1].0, 45);
+            assert_eq!(root_node.entries[1].0, 43);
         }
-
-
     }
 
+
+    #[test]
+    fn btree_split_stops_at_grandparent() {
+        let mut btree = BTree::new();
+        btree.set_leaf_max_size(3);
+        btree.set_internal_max_size(3);
+
+        for (k, pid) in [
+            (10, 1), (20, 2), (30, 3), (40, 4), (50, 5), (60, 6),
+            (70, 7), (80, 8), (90, 9), (100, 10), (110, 11),
+        ] {
+            btree.insert(k, pid, DEFAULT_SLOT_NUMBER);
+        }
+
+        let root_before = btree.root_page_id;
+
+        btree.insert(120, 12, DEFAULT_SLOT_NUMBER);
+
+        let header_guard = btree.buffer_pool.check_read_page(btree.header_page_id).unwrap();
+        let header_data = header_guard.data().unwrap();
+        let root_from_header = u32::from_le_bytes(header_data[0..4].try_into().unwrap());
+
+        assert_eq!(root_from_header, root_before);
+
+        let root_guard = btree.buffer_pool.check_read_page(root_from_header).unwrap();
+        let root = InternalNode::decode(&root_guard.data().unwrap()[..]);
+
+        assert_eq!(root.entries.len(), 3);
+        assert_eq!(root.entries[0].0, INVALID_KEY);
+        assert_eq!(root.entries[1].0, 50);
+        assert_eq!(root.entries[2].0, 90);
+    }
+
+    // TODO next add find function for search and do latch crabbing in insert
 }

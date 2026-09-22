@@ -70,6 +70,10 @@ impl WritePageGuard {
     pub fn data(&self) -> LockResult<RwLockReadGuard<'_, Vec<u8>>> {
         self.frame.data.read()
     }
+
+    pub fn page_id(&self) -> PageId {
+        self.page_id
+    }
 } 
 
 impl Drop for WritePageGuard {
@@ -142,6 +146,10 @@ impl ReadPageGuard {
 
         self.frame.is_dirty.store(false, Ordering::SeqCst);
         return true;
+    }
+
+    pub fn page_id(&self) -> PageId {
+        self.page_id
     }
 }
 
