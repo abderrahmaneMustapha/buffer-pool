@@ -112,6 +112,29 @@ impl LeafNode {
             off += 16
         }
     }
+
+    fn find_kv_index(&self, key: Key) -> Option<LeafKv> {
+        let mut low: usize = 0;
+        let mut high: usize = self.entries.len();
+        let mut res: Option<LeafKv> = None;
+
+        while low < high {
+            let mid = low + (high - low) / 2;
+
+            if self.entries[mid].0 <= key {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+
+            if self.entries[mid].0 == key {
+                res = Some(self.entries[mid]);
+                break;
+            }
+        }
+
+        res
+    }
 }
 
 
@@ -201,19 +224,24 @@ impl BTree {
         bytes[0 .. 4].copy_from_slice(&self.root_page_id.to_le_bytes());
     }
 
-    fn find(&mut self, key: Key) -> Option<LeafNode> {
-        let header_guard = self.buffer_pool.check_read_page(self.header_page_id).unwrap();
-        let header_data = header_guard.data().unwrap();
-        let mut id_to_next_child = u32::from_le_bytes(header_data[0 .. 4].try_into().unwrap());
-        let mut leaf_node: Option<LeafNode> = None;
+    fn find(&mut self, key: Key) -> Option<LeafKv> {
+        let mut id_to_next_child =  {
+            let header_guard = self.buffer_pool.check_read_page(self.header_page_id).unwrap();
+            let header_data = header_guard.data().unwrap();
+
+            u32::from_le_bytes(header_data[0 .. 4].try_into().unwrap())
+        };
+
+        let mut leaf_kv: Option<LeafKv> = None;
+
         loop {
             let page_guard = self.buffer_pool.check_read_page(id_to_next_child).unwrap();
             let data = page_guard.data().unwrap();
             let node_type = data[0];
 
             if node_type == LEAF_NODE {
-                leaf_node = Some(LeafNode::decode(&data[..]));
-                break;
+                let leaf = LeafNode::decode(&data[..]);
+                leaf_kv = leaf.find_kv_index(key);
             } 
             
             if node_type == INTERNAL_NODE {
@@ -221,9 +249,13 @@ impl BTree {
                 let slot_to_next_child = internal.find_child_index(key);
                 id_to_next_child = internal.entries[slot_to_next_child].1;
             }
+
+            else {
+                break;
+            }
         }
 
-        leaf_node
+        leaf_kv
     }
 
     fn insert(&mut self, key: Key, page_id: PageId, slot_num: u32) {
