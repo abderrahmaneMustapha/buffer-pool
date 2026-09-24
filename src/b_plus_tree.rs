@@ -201,19 +201,29 @@ impl BTree {
         bytes[0 .. 4].copy_from_slice(&self.root_page_id.to_le_bytes());
     }
 
-    fn DEPRECATED_get_child(&mut self, child: &InternalNode, key: Key) -> DEPRECATED_LocatedNode {
-        let child_index = child.find_child_index(key);
-        let child_page_id = child.entries[child_index].1;
+    fn find(&mut self, key: Key) -> Option<LeafNode> {
+        let header_guard = self.buffer_pool.check_read_page(self.header_page_id).unwrap();
+        let header_data = header_guard.data().unwrap();
+        let mut id_to_next_child = u32::from_le_bytes(header_data[0 .. 4].try_into().unwrap());
+        let mut leaf_node: Option<LeafNode> = None;
+        loop {
+            let page_guard = self.buffer_pool.check_read_page(id_to_next_child).unwrap();
+            let data = page_guard.data().unwrap();
+            let node_type = data[0];
 
-        let page_guard = self.buffer_pool.check_read_page(child_page_id).unwrap();
-        let page_data = page_guard.data().unwrap();
-        let node_type = page_data[0];
-
-        match page_data[0] {
-            LEAF_NODE => DEPRECATED_LocatedNode { parent_page_id: child_page_id, parent_key_index: child_index, page_id: child_page_id, node: TreeNode::Leaf(LeafNode::decode(&page_data[..])) },
-            INTERNAL_NODE => DEPRECATED_LocatedNode { parent_page_id: child_page_id, parent_key_index: child_index, page_id: child_page_id, node: TreeNode::Internal(InternalNode::decode(&page_data[..])) },
-            _ => panic!("unknown node type")
+            if node_type == LEAF_NODE {
+                leaf_node = Some(LeafNode::decode(&data[..]));
+                break;
+            } 
+            
+            if node_type == INTERNAL_NODE {
+                let internal = InternalNode::decode(&data[..]);
+                let slot_to_next_child = internal.find_child_index(key);
+                id_to_next_child = internal.entries[slot_to_next_child].1;
+            }
         }
+
+        leaf_node
     }
 
     fn insert(&mut self, key: Key, page_id: PageId, slot_num: u32) {
@@ -805,7 +815,6 @@ mod b_plus_tree_testing {
         }
     }
 
-
     #[test]
     fn btree_split_stops_at_grandparent() {
         let mut btree = BTree::new();
@@ -838,5 +847,9 @@ mod b_plus_tree_testing {
         assert_eq!(root.entries[2].0, 90);
     }
 
+    #[test]
+    fn btree_find() {
+
+    }
     // TODO next add find function for search and do latch crabbing in insert
 }
