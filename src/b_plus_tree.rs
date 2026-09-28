@@ -346,8 +346,15 @@ impl BTree {
 
                             slot_to_next_child = INVALID_PAGE_ID as usize;
 
-                            let guard = self.buffer_pool.check_write_page(child_page_id).unwrap();
-                    
+                            let mut guard = self.buffer_pool.check_write_page(child_page_id).unwrap();
+                            
+                            {
+                                let data = guard.data_mut().unwrap();
+                                let node = LeafNode::decode(&data[..]);
+                                if node.entries.len() < self.leaf_node_max_size.try_into().unwrap() {
+                                    path_stack.clear();
+                                }
+                            }
                             path_stack.push(PathFrame {
                                 guard,
                                 slot_to_next_child,
@@ -355,7 +362,14 @@ impl BTree {
                             break;
                         }
 
-                        let guard = self.buffer_pool.check_write_page(child_page_id).unwrap();
+                        let mut guard = self.buffer_pool.check_write_page(child_page_id).unwrap();
+                        {
+                            let data = guard.data_mut().unwrap();
+                            let node = InternalNode::decode(&data[..]);
+                            if node.entries.len() < self.internal_node_max_size.try_into().unwrap() {
+                                path_stack.clear();
+                            }
+                        }
                         path_stack.push(PathFrame {
                             guard,
                             slot_to_next_child,
