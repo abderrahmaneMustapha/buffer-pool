@@ -375,7 +375,6 @@ impl BTree {
                 leaf_node.encode(&mut leaf_data[..]);
 
                 if leaf_node.entries.len() > self.leaf_node_max_size.try_into().unwrap() {
-                    println!("we are splitting things here len {}, max len {}, leaf page id {}", leaf_node.entries.len(), self.leaf_node_max_size, leaf_page_id);
                     leaf_page_id
                 } else {
                     INVALID_PAGE_ID
@@ -420,7 +419,7 @@ impl BTree {
                 let (sep_key, ..) = middle_entry;
                 let mut intended_insert = (sep_key, right_leaf_page_id);
                 let mut left_page_id = left_leaf_page_id;
-                println!("stack len {}", path_stack.len());
+
                 loop {
                     match path_stack.pop() {
                         Some(frame) => {
@@ -467,7 +466,6 @@ impl BTree {
                         }
 
                         None => {
-                            println!("asndioashdas");
                             let root_page_id = {
                                 let new_root_page_id = self.buffer_pool.new_page();
                                 let mut root_page_guard = self.buffer_pool.check_write_page(new_root_page_id).unwrap();
@@ -881,7 +879,42 @@ mod b_plus_tree_testing {
 
     #[test]
     fn btree_find() {
+        let mut btree = BTree::new();
+        btree.set_leaf_max_size(3);
+        btree.set_internal_max_size(3);
 
+        for (k, pid) in [
+            (10, 1), (20, 2), (30, 3), (40, 4), (50, 5), (60, 6),
+            (70, 7), (80, 8), (90, 9), (100, 10), (110, 11), (120, 12)
+        ] {
+            btree.insert(k, pid, DEFAULT_SLOT_NUMBER);
+        }
+        
+        assert_eq!(btree.find(55), None);
+
+        assert_eq!(
+            btree.find(50), 
+            Some((50, RecordId { page_id: 5, slot_num: DEFAULT_SLOT_NUMBER })),
+        );
+
+        assert_eq!(
+            btree.find(90),
+            Some((90, RecordId { page_id: 9, slot_num: DEFAULT_SLOT_NUMBER }))
+        );
+
+        assert_eq!(
+            btree.find(10),
+            Some((10, RecordId { page_id: 1, slot_num: DEFAULT_SLOT_NUMBER }))
+        );
+
+        assert_eq!(
+            btree.find(70),
+            Some((70, RecordId { page_id: 7, slot_num: DEFAULT_SLOT_NUMBER }))
+        );
+
+        assert_eq!(
+            btree.find(120),
+            Some((120, RecordId { page_id: 12, slot_num: DEFAULT_SLOT_NUMBER }))
+        );
     }
-    // TODO next add find function for search and do latch crabbing in insert
 }
