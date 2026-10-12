@@ -63,6 +63,29 @@ pub struct BTree {
     internal_node_max_size: u32,
 }
 
+struct Scan<'a> {
+    tree: &'a mut BTree,
+    page_id: PageId,
+}
+
+impl<'a> Iterator for Scan<'a> {
+    type Item = LeafNode;
+
+    fn next(&mut self) -> Option<LeafNode> {
+        if self.page_id == INVALID_PAGE_ID {
+            return None;
+        }
+
+        let leaf = {
+            let page_guard = self.tree.buffer_pool.check_read_page(self.page_id).unwrap();
+            let data = page_guard.data().unwrap();
+            LeafNode::decode(&data[..])
+        };
+
+        self.page_id = leaf.next_page_id;
+        Some(leaf)
+    }
+}
  
 impl LeafNode {
 
@@ -224,7 +247,7 @@ impl BTree {
         bytes[0 .. 4].copy_from_slice(&self.root_page_id.to_le_bytes());
     }
 
-    fn find_leaf(&mut self, key: Key) -> Option<LeafNode> {
+    fn find_leaf(&mut self, key: Key) -> Option<(LeafNode, PageId)> {
         let mut id_to_next_child = {
             let header_guard = self.buffer_pool.check_read_page(self.header_page_id).unwrap();
             let header_data = header_guard.data().unwrap();
@@ -232,7 +255,7 @@ impl BTree {
             u32::from_le_bytes(header_data[0 .. 4].try_into().unwrap())
         };
 
-        let mut leaf: Option<LeafNode> = None;
+        let mut leaf: Option<(LeafNode, PageId)> = None;
 
         loop {
             let page_guard = self.buffer_pool.check_read_page(id_to_next_child).unwrap();
@@ -240,7 +263,7 @@ impl BTree {
             let node_type = data[0];
 
             if node_type == LEAF_NODE {
-                leaf = Some(LeafNode::decode(&data[..]));
+                leaf = Some((LeafNode::decode(&data[..]), id_to_next_child));
             }
 
             if node_type == INTERNAL_NODE {
@@ -260,7 +283,7 @@ impl BTree {
     pub fn find(&mut self, key: Key) -> Option<LeafKv> {
         match self.find_leaf(key) {
             Some(leaf) => {
-                leaf.find_kv(key)
+                leaf.0.find_kv(key)
             }
 
             None => {
@@ -517,8 +540,14 @@ impl BTree {
             }
         }
     }
-}
 
+    pub fn scan(&mut self, key: Key) -> Scan<'_> {
+        Scan {
+            page_id: self.find_leaf(key).unwrap().1,
+            tree: self,
+        }
+    }
+}
 
 #[cfg(test)]
 mod b_plus_tree_testing {
@@ -939,5 +968,22 @@ mod b_plus_tree_testing {
             btree.find(120),
             Some((120, RecordId { page_id: 12, slot_num: DEFAULT_SLOT_NUMBER }))
         );
+    }
+
+    #[test]
+    fn btree_scan() {
+        let mut btree = BTree::new();
+        btree.set_leaf_max_size(3);
+
+        for (k, pid) in [(10, 1), (20, 2), (30, 3), (40, 4), (50, 5), (60, 6)] {
+            btree.insert(k, pid, DEFAULT_SLOT_NUMBER);
+        }
+        
+        
+        let mut iterator = btree.scan(10);
+
+        assert_eq!(iterator.next().unwrap().next_page_id, 2);
+        assert_eq!(iterator.next().unwrap().next_page_id, 4);
+        assert_eq!(iterator.next().unwrap().next_page_id, INVALID_PAGE_ID);
     }
 }
