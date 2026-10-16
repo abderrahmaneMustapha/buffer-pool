@@ -122,7 +122,7 @@ impl LeafNode {
     fn encode(&self, bytes: &mut [u8]) {
         bytes[0] = 1; // a leaf page
         // we are using copy_from_slice where the two side must fit in the same size 
-        // and also it should  have implement the Copy trait
+        // it should  have implement the Copy trait
         bytes[4 .. 8].copy_from_slice(&(self.entries.len() as u32).to_le_bytes());
         bytes[8 .. 12].copy_from_slice(&DEFAULT_LEAF_NODE_MAX_SIZE.to_le_bytes());
         bytes[12 .. 16].copy_from_slice(&self.next_page_id.to_le_bytes());
@@ -418,11 +418,11 @@ impl BTree {
                 let mut leaf_node = LeafNode::decode(&leaf_data[..]);
                 leaf_node.entries.push((key, RecordId { page_id, slot_num }));
                 leaf_node.entries.sort_unstable_by_key(|item| item.0);
-                leaf_node.encode(&mut leaf_data[..]);
 
                 if leaf_node.entries.len() > self.leaf_node_max_size.try_into().unwrap() {
                     leaf_page_id
                 } else {
+                    leaf_node.encode(&mut leaf_data[..]);
                     INVALID_PAGE_ID
                 }
             };
@@ -439,6 +439,8 @@ impl BTree {
                     let mut left_leaf_guard = self.buffer_pool.check_write_page(left_leaf_page_id).unwrap();
                     let mut left_leaf_data = left_leaf_guard.data_mut().unwrap();
                     let mut left_leaf = LeafNode::decode(&left_leaf_data[..]);
+                    left_leaf.entries.push((key, RecordId { page_id, slot_num }));
+                    left_leaf.entries.sort_unstable_by_key(|item| item.0);
 
                     let middle_index = left_leaf.entries.len() / 2;
                     middle_entry = left_leaf.entries[middle_index];
