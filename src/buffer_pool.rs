@@ -160,16 +160,18 @@ impl BufferPoolManager {
                 let old_page_id = to_remove.expect("evicted frame must have a page id");
                 self.page_table.remove(&old_page_id);
 
-                let write_guard = WritePageGuard::new(
-                    old_page_id, 
-                    frame,
-                    Arc::clone(&self.arc_replacer),
-                    Arc::clone(&self.latch),
-                    Arc::clone(&self.disk_scheduler),
-                );
+                let data = frame.data.read().unwrap().clone();
 
-                write_guard.flush();
-                self.frames[frame_id as usize].reset();
+                let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
+                self.disk_scheduler.schedule(DiskRequest {
+                    r#type: DiskRequestType::Write,
+                    page_id: old_page_id,
+                    data,
+                    promise: tx,
+                });
+                rx.recv().unwrap();
+                frame.is_dirty.store(false, Ordering::SeqCst);
+                frame.reset();
             }
             // add the new page
             let frame_id = self.free_frames.pop().unwrap();
@@ -268,16 +270,18 @@ impl BufferPoolManager {
                 let old_page_id = to_remove.expect("evicted frame must have a page id");
                 self.page_table.remove(&old_page_id);
 
-                let read_guard = ReadPageGuard::new(
-                    old_page_id,
-                    frame,
-                    Arc::clone(&self.arc_replacer),
-                    Arc::clone(&self.latch),
-                    Arc::clone(&self.disk_scheduler),
-                );
+                let data = frame.data.read().unwrap().clone();
 
-                read_guard.flush();
-                self.frames[frame_id as usize].reset();
+                let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
+                self.disk_scheduler.schedule(DiskRequest {
+                    r#type: DiskRequestType::Write,
+                    page_id: old_page_id,
+                    data,
+                    promise: tx,
+                });
+                rx.recv().unwrap();
+                frame.is_dirty.store(false, Ordering::SeqCst);
+                frame.reset();
             }
 
             let frame_id = self.free_frames.pop().unwrap();
