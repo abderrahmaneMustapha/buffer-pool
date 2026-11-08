@@ -8,6 +8,7 @@ use crate::disk_manager::DiskManager;
 use crate::common::{PageId, INVALID_PAGE_ID};
 use crate::guard::WritePageGuard;
 use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
 
 const DEFAULT_LEAF_NODE_MAX_SIZE: u32 = 511;
 const DEFAULT_INTERNAL_NODE_MAX_SIZE: u32 = 681;
@@ -278,6 +279,130 @@ impl BTree {
         }
 
         leaf
+    }
+
+    fn verify(&mut self) -> bool {
+        if self.root_page_id == INVALID_PAGE_ID {
+            return true;
+        }
+
+        let mut seen_leaf_full_walk = HashSet::new();
+        let mut seen_leaf_chain_walk = HashSet::new();
+        let verified = self.verify_node(self.root_page_id, None, None, &mut seen_leaf_full_walk) 
+                       && self.verify_chain(&mut seen_leaf_chain_walk);
+
+        return (seen_leaf_full_walk.len() == seen_leaf_chain_walk.len()) && verified;
+    }
+
+    fn verify_node(&mut self, page_id: PageId, lo: Option<Key>, hi: Option<Key>, seen_leaf: &mut HashSet<PageId>) -> bool {
+        let guard = self.buffer_pool.check_read_page(page_id).unwrap();
+        let data = guard.data().unwrap();
+        let node_type = data[0];
+
+        if node_type == LEAF_NODE {
+            let node = LeafNode::decode(&data[..]);
+            if !node.entries.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+                return false;
+            }
+
+            for (k, _) in node.entries.iter() {
+                if let Some(lo) = lo { if *k < lo {
+                    return false;
+                }};
+                if let Some(hi) = hi { if *k >= hi {
+                    return false;
+                }};
+            }
+
+            seen_leaf.insert(page_id);
+            return true;
+        }
+
+        if node_type == INTERNAL_NODE {
+            let node = InternalNode::decode(&data[..]);
+
+            if !node.entries.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+                return false;
+            }
+
+            for (k, _) in node.entries.iter().skip(1) {
+                if let Some(lo) = lo { if *k < lo {
+                    return false;
+                }};
+                if let Some(hi) = hi { if *k >= hi {
+                    return false;
+                }};
+            }
+
+            for i in 0..node.entries.len() {
+                let child_pid = node.entries[i].1;
+                let child_lo = if i == 0 { lo } else { Some(node.entries[i].0) };
+                let child_hi = if i == node.entries.len() - 1 { hi } else { Some(node.entries[i+1].0) };
+                if !self.verify_node(child_pid, child_lo, child_hi, seen_leaf) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        return false;
+    }
+
+    fn verify_chain(&mut self, seen: &mut HashSet<PageId>) -> bool {
+        let mut target_page_id = self.root_page_id;
+        loop {
+            let guard = self.buffer_pool.check_read_page(target_page_id).unwrap();
+            let data = guard.data().unwrap();
+            let node_type = data[0];
+
+            if node_type == LEAF_NODE {
+                break;
+            }
+
+            if node_type == INTERNAL_NODE {
+                let current_node = InternalNode::decode(&data[..]);
+                target_page_id = current_node.entries[0].1
+            }
+        }
+
+        let mut next_page_id = target_page_id;
+        let mut sibling_last_key = INVALID_KEY;
+
+        loop {
+            let not_seen = seen.insert(next_page_id);
+            if !not_seen {
+                return false;
+            } 
+
+            let guard = self.buffer_pool.check_read_page(next_page_id).unwrap();
+            let data = guard.data().unwrap();
+
+            let node_type = data[0];
+            if node_type != LEAF_NODE {
+                return false;
+            }
+
+            let current_node = LeafNode::decode(&data[..]);
+
+            let is_sorted = current_node.entries.is_sorted_by_key(|&(key, _)| key);
+            if !is_sorted {
+                return false;
+            }
+
+            let first_key = current_node.entries[0].0;
+
+            if sibling_last_key >= first_key {
+                return false;
+            }
+            sibling_last_key = current_node.entries.last().unwrap().0;
+            next_page_id = current_node.next_page_id;
+
+            if next_page_id == INVALID_PAGE_ID {
+                break;
+            }
+        }
+
+        return true;
     }
 
     pub fn find(&mut self, key: Key) -> Option<LeafKv> {
@@ -987,5 +1112,28 @@ mod b_plus_tree_testing {
         assert_eq!(iterator.next().unwrap().next_page_id, 2);
         assert_eq!(iterator.next().unwrap().next_page_id, 4);
         assert_eq!(iterator.next().unwrap().next_page_id, INVALID_PAGE_ID);
+    }
+
+    #[test]
+    fn btree_verify_structor() {
+        let mut btree = BTree::new();
+        btree.set_leaf_max_size(3);
+        btree.set_internal_max_size(3);
+
+        /*
+                                    50
+                       /                          \
+                    30                         70, 90
+               /          \               /       |        \
+          [10,20]      [30,40]       [50,60]   [70,80]   [90,100,110]
+        */
+        for (k, pid) in [
+            (10, 1), (20, 2), (30, 3), (40, 4), (50, 5), (60, 6),
+            (70, 7), (80, 8), (90, 9), (100, 10), (110, 11),
+        ] {
+            btree.insert(k, pid, DEFAULT_SLOT_NUMBER);
+        }
+
+        assert_eq!(btree.verify(), true);
     }
 }
