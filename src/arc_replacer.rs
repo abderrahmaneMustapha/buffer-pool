@@ -50,6 +50,13 @@ impl ArcReplacer {
         self.evictable_pages.insert(frame_id);
         self.curr_size += 1;
     }
+
+    pub fn set_unevictable(&mut self, frame_id: u32) {
+        if self.evictable_pages.contains(&frame_id) {
+            self.evictable_pages.remove(&frame_id);
+            self.curr_size -=1;
+        }
+    }
     
     pub fn record_access(&mut self, frame_id: u32, page_id: u32) {
 
@@ -80,7 +87,7 @@ impl ArcReplacer {
         }
 
         if self.mfu_ghost.contains(&page_id) {
-            if self.mfu_ghost.len() >= self.mru_ghost.len() && (self.mru_target_size - 1) > 0 {
+            if self.mfu_ghost.len() >= self.mru_ghost.len() && (self.mru_target_size) > 1 {
                 self.mru_target_size -= 1;
             } else {
                 let decrease: u32 = (self.mru_ghost.len() / self.mfu_ghost.len()) as u32;

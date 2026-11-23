@@ -7,8 +7,11 @@ use crate::buffer_pool::BufferPoolManager;
 use crate::disk_manager::DiskManager;
 use crate::common::{PageId, INVALID_PAGE_ID};
 use crate::guard::WritePageGuard;
+
 use std::sync::{Arc, Mutex};
-use std::collections::HashSet;
+use std::collections::{HashSet, BTreeMap};
+
+use rand::RngExt;
 
 const DEFAULT_LEAF_NODE_MAX_SIZE: u32 = 511;
 const DEFAULT_INTERNAL_NODE_MAX_SIZE: u32 = 681;
@@ -213,7 +216,7 @@ impl InternalNode {
             }
         }
 
-        low - 1
+        return low - 1;
     }
 }
 
@@ -449,6 +452,16 @@ impl BTree {
 
         // other insertions
         else {
+
+            match self.find(key) {
+                Some(leaf) => {
+                    panic!("duplicated key has been inserted {}", key);
+                }
+
+                None => {
+                }
+            }
+
             // this is where we go advanced splits we get a stack and we save the write guards
             let mut path_stack: Vec<PathFrame> = vec![];
 
@@ -679,6 +692,17 @@ impl BTree {
 #[cfg(test)]
 mod b_plus_tree_testing {
     use super::*;
+    use rand::rngs::StdRng;
+    use rand::seq::SliceRandom;
+    use rand::SeedableRng;
+
+    // Same seed gives the same order, so a failing run can be replayed.
+    fn shuffled_keys_and_pids(count: u32, seed: u64) -> Vec<(Key, PageId)> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut pairs: Vec<(Key, PageId)> = (0..count).map(|i| (i64::from(i), i)).collect();
+        pairs.shuffle(&mut rng);
+        pairs
+    }
 
     #[test]
     fn basic_leaf_encode_decode() {
@@ -1135,5 +1159,28 @@ mod b_plus_tree_testing {
         }
 
         assert_eq!(btree.verify(), true);
+    }
+
+    #[test]
+    fn btree_random_operations_verify() {
+        let mut btree = BTree::new();
+        let mut btree_map = BTreeMap::new();
+        let mut rng = rand::rng();
+
+        btree.set_leaf_max_size(20);
+        btree.set_internal_max_size(20);
+
+        let seed = 42;
+        for (key, pid) in shuffled_keys_and_pids(1000, seed) {
+            btree.insert(key, pid, DEFAULT_SLOT_NUMBER);
+            btree_map.insert(key, pid);
+            //println!("key= {} || pid={} || run={}", key, pid, run);
+            assert_eq!(btree.verify(), true);
+        }
+
+        for key in btree_map.keys() {
+            let res = btree.find(*key);
+            assert_ne!(res, None);
+        }
     }
 }

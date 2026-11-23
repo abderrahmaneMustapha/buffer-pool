@@ -28,6 +28,7 @@ impl WritePageGuard {
     ) -> Self {
         frame.pin_count.fetch_add(1, Ordering::SeqCst);
         arc_replacer.lock().unwrap().record_access(frame.frame_id, page_id);
+        arc_replacer.lock().unwrap().set_unevictable(frame.frame_id);
 
         Self {
             page_id, 
@@ -111,6 +112,7 @@ impl ReadPageGuard {
     ) -> Self {
         frame.pin_count.fetch_add(1, Ordering::SeqCst);
         arc_replacer.lock().unwrap().record_access(frame.frame_id, page_id);
+        arc_replacer.lock().unwrap().set_unevictable(frame.frame_id);
 
         Self {
             page_id, 
