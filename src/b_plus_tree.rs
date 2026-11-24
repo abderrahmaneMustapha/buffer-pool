@@ -150,6 +150,29 @@ impl LeafNode {
 
         res
     }
+
+    fn remove_kv(&mut self, key: Key) -> bool {
+        let mut low: usize = 0;
+        let mut high: usize = self.entries.len();
+        let mut res: Option<LeafKv> = None;
+
+        while low < high {
+            let mid = low + (high - low) / 2;
+
+            if self.entries[mid].0 <= key {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+
+            if self.entries[mid].0 == key {
+                self.entries.remove(mid);
+                return true;
+            }
+        }
+
+        return false;
+    }
 }
 
 
@@ -675,6 +698,23 @@ impl BTree {
             tree: self,
         }
     }
+
+    pub fn remove(&mut self, key: Key) -> bool {
+        let Some((mut leaf, page_id)) = self.find_leaf(key) else {
+            return false;
+        };
+
+        let removed = leaf.remove_kv(key);
+
+        if removed == true {
+            let mut page_guard = self.buffer_pool.check_write_page(page_id).unwrap();
+            let mut data = page_guard.data_mut().unwrap();
+
+            leaf.encode(&mut data[..]);
+        }
+
+        return removed;
+    }
 }
 
 #[cfg(test)]
@@ -1153,7 +1193,6 @@ mod b_plus_tree_testing {
     fn btree_random_operations_verify() {
         let mut btree = BTree::new();
         let mut btree_map = BTreeMap::new();
-        let mut rng = rand::rng();
 
         btree.set_leaf_max_size(20);
         btree.set_internal_max_size(20);
@@ -1170,5 +1209,19 @@ mod b_plus_tree_testing {
             let res = btree.find(*key);
             assert_ne!(res, None);
         }
+    }
+
+    #[test]
+    fn btree_remove_key() {
+        let mut btree = BTree::new();
+
+        for (k, pid) in [(10, 1), (20, 2), (30, 3), (40, 4), (50, 5), (60, 6)] {
+            btree.insert(k, pid, DEFAULT_SLOT_NUMBER);
+        }
+
+        let removed = btree.remove(20);
+
+        assert_eq!(removed, true);
+        assert_eq!(btree.find(20), None);
     }
 }
