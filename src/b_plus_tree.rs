@@ -24,18 +24,6 @@ const DEFAULT_SLOT_NUMBER: u32 = 0;
 type Key = i64;
 const INVALID_KEY: Key = i64::MIN;
 
-enum TreeNode {
-    Leaf(LeafNode),
-    Internal(InternalNode)
-}
-
-struct DEPRECATED_LocatedNode {
-    parent_key_index: usize,
-    parent_page_id: PageId,
-    page_id: PageId,
-    node: TreeNode,
-}
-
 struct PathFrame {
     slot_to_next_child: usize,
     guard: WritePageGuard,
